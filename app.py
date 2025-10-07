@@ -99,7 +99,7 @@ t1, t2, t3, t4, t5, t6 = st.tabs(["1) Upload", "2) Clean Standards", "3) Curves"
 
 # 1) Upload
 with t1:
-    up = st.file_uploader("📄 qPCR結果ファイル（TXT/TSV/CSV）", type=["txt","tsv","csv"])
+    up = st.file_uploader("📄 qPCRResultFile（TXT/TSV/CSV）", type=["txt","tsv","csv"])
     if st.button("Load file") and up:
         try:
             df = clean_dataframe_for_analysis(read_qpcr_textfile(up.read()))
@@ -117,7 +117,7 @@ with t1:
 # 2) Clean Standards
 with t2:
     if st.session_state.df_raw is None:
-        st.info("先に Upload を完了してください。")
+        st.info("Please Complete Upload")
     else:
         df_std = st.session_state.df_raw.copy()
         df_std = df_std[df_std["Task"].astype(str).str.lower()=="standard"].dropna(subset=["Ct"]).copy()
@@ -142,7 +142,7 @@ with t2:
 # 3) Standard Curves
 with t3:
     if st.session_state.df_std_clean is None:
-        st.info("2) Clean Standards を先に実行してください。")
+        st.info("2) Please do Clean Standards")
     else:
         buf_pdf = io.BytesIO()
         with PdfPages(buf_pdf) as pdf:
@@ -154,9 +154,9 @@ with t3:
                 ax.set_xlabel("log10(Quantity)"); ax.set_ylabel("Ct")
                 if sc:
                     x = np.log10(ddf["Quantity"]); y = ddf["Ct"]
-                    ax.scatter(x,y)
+                    ax.scatter(x,y, color="black", s=12)
                     xx = np.linspace(x.min(), x.max(), 100).reshape(-1,1)
-                    ax.plot(xx, sc["model"].predict(xx), "--")
+                    ax.plot(xx, sc["model"].predict(xx), "--", linewidth=0.8, color="black")
                     ax.text(0.02,0.02,f"slope={sc['slope']:.3f}\nR²={sc['r2']:.3f}", transform=ax.transAxes)
                 else:
                     ax.text(0.5,0.5,"Insufficient points", ha="center")
@@ -168,12 +168,12 @@ with t3:
 # 4) Assign
 with t4:
     if st.session_state.df_raw is None:
-        st.info("先に Upload を完了してください。")
+        st.info("Please Complete Upload")
     else:
         df_smp = st.session_state.df_raw.copy()
         df_smp = df_smp[df_smp["Task"].astype(str).str.lower()=="unknown"].copy()
         if df_smp.empty:
-            st.warning("Unknown 行がありません。")
+            st.warning("NoUnknown")
         else:
             st.session_state.conditions = st.text_area(
                 "Conditions (1行に1つ)", value="\n".join(st.session_state.conditions), height=100
@@ -199,73 +199,58 @@ with t4:
                     st.session_state.df_smp = df_smp
                     st.success("Assignments saved.")
 
-# 5) Quantify
+# 5) Quantify（Undetectedは Quantity=0 として扱い、SEMで描画）
 with t5:
     if st.session_state.df_smp is None or st.session_state.df_std_clean is None:
-        st.info("2) と 4) を先に完了してください。")
+        st.info("Please Complete 2) & 4)")
     else:
-        # --- ヘルパー: Ct→Quantity（Undetected=0 とみなす） ---
+        # Ct→Quantity（Ct欠損/Undetectedは0扱い）
         def _ct_to_qty(ct, slope, intercept):
             if pd.isna(ct):
-                return 0.0  # 検出なしは 0
+                return 0.0
             if slope == 0 or np.isnan(slope):
                 return np.nan
             return float(10 ** ((ct - intercept) / slope))
 
-        # --- 1) 標準曲線から Quantity を算出 ---
         df_smp = st.session_state.df_smp.copy()
         df_smp["Quantity"] = np.nan
 
         for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
-            # 対象Detectorの標準点を抽出
             dstd = st.session_state.df_std_clean[
-                (st.session_state.df_std_clean["Detector Name"] == det)
-                & (st.session_state.df_std_clean["Task"].astype(str).str.lower() == "standard")
+                (st.session_state.df_std_clean["Detector Name"] == det) &
+                (st.session_state.df_std_clean["Task"].astype(str).str.lower() == "standard")
             ].copy()
-
-            # 安全ガード: 欠損除去 & Quantity>0 のみ採用（log10のため）
-            dstd = dstd.replace([np.inf, -np.inf], np.nan)
-            dstd = dstd.dropna(subset=["Ct", "Quantity"])
+            dstd = dstd.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct","Quantity"])
             dstd = dstd[dstd["Quantity"] > 0]
-
             if len(dstd) < 2:
                 st.warning(f"'{det}': 標準点が2点未満または Quantity<=0。計算スキップ。")
                 continue
 
-            # 線形回帰: Ct = slope * log10(Q) + intercept
             X = np.log10(dstd["Quantity"].to_numpy()).reshape(-1, 1)
             y = dstd["Ct"].to_numpy()
             model = LinearRegression().fit(X, y)
             slope = float(model.coef_[0]); intercept = float(model.intercept_)
 
-            # Unknown行に Quantity を付与（Ct=NaN は 0 として入る）
-            rows = (df_smp["Detector Name"] == det) & df_smp["Ct"].notna()
-            # Ct が NaN の行も 0 にしたいので、全行に対して ct を取りに行く
             rows_all = (df_smp["Detector Name"] == det)
             df_smp.loc[rows_all, "Quantity"] = df_smp.loc[rows_all, "Ct"].apply(
                 lambda c: _ct_to_qty(c, slope, intercept)
             )
-            # 非物理値は NaN
             df_smp.loc[rows_all & (df_smp["Quantity"] < 0), "Quantity"] = np.nan
 
-        # --- 2) Control detector を選択し、RelQ を計算 ---
         detectors_for_ctrl = sorted(df_smp["Detector Name"].dropna().unique().tolist())
         if not detectors_for_ctrl:
-            st.error("Detector Name が見つかりません。Upload/Assign を見直してください。")
+            st.error("Detector Name was not found. Please check Upload/Assign")
         else:
             ctrl_det = st.selectbox("Control detector", detectors_for_ctrl, key="ctrl_det_select")
 
             if st.button("Run Relative Quantification"):
-                # Control の Quantity（分母候補）
                 ctrl_df = (
                     df_smp[df_smp["Detector Name"] == ctrl_det][["Condition", "Replicate", "Quantity"]]
                     .rename(columns={"Quantity": "Ctrl_Quantity"})
                     .copy()
                 )
-                # 分母が 0/負/NaN は無効扱い（分母0回避のため）
                 ctrl_df.loc[(ctrl_df["Ctrl_Quantity"] <= 0) | (ctrl_df["Ctrl_Quantity"].isna()), "Ctrl_Quantity"] = np.nan
 
-                # Fallback: Condition 平均（>0 のみが平均に寄与する）
                 ctrl_cond_mean = (
                     ctrl_df.groupby("Condition", as_index=False)["Ctrl_Quantity"]
                     .mean()
@@ -276,7 +261,6 @@ with t5:
                 if "Relative Quantity" not in df_temp.columns:
                     df_temp["Relative Quantity"] = np.nan
 
-                # 各Detectorについて、Condition×Replicate で Control を対応付け
                 for det in df_temp["Detector Name"].dropna().unique():
                     mask = df_temp["Detector Name"] == det
                     ddet = (
@@ -284,30 +268,22 @@ with t5:
                         .reset_index()
                         .rename(columns={"index": "orig_index"})
                     )
-
-                    merged = ddet.merge(ctrl_df, on=["Condition", "Replicate"], how="left")
-
-                    # 一致するCtrlが無い行は Condition平均で補完
+                    merged = ddet.merge(ctrl_df, on=["Condition","Replicate"], how="left")
                     if merged["Ctrl_Quantity"].isna().any():
                         merged = merged.merge(ctrl_cond_mean, on="Condition", how="left")
                         merged["Used_Ctrl"] = merged["Ctrl_Quantity"].fillna(merged["Ctrl_Cond_Mean"])
                     else:
                         merged["Used_Ctrl"] = merged["Ctrl_Quantity"]
 
-                    # --- 分母0/負や欠損は NaN に（ゼロ割回避）、数量の負も NaN ---
                     invalid_den = merged["Used_Ctrl"].isna() | (merged["Used_Ctrl"] <= 0)
                     invalid_num = merged["Quantity"].isna() | (merged["Quantity"] < 0)
-
                     merged["Relative Quantity"] = np.where(
                         invalid_den | invalid_num,
                         np.nan,
                         merged["Quantity"] / merged["Used_Ctrl"]
                     )
-
-                    # 元の行へ反映
                     df_temp.loc[merged["orig_index"], "Relative Quantity"] = merged["Relative Quantity"].values
 
-                # --- 3) Detector×Condition×Replicate で平均/SEM 付与（表示用）---
                 stats = (
                     df_temp.groupby(["Detector Name", "Condition", "Replicate"], observed=False)["Relative Quantity"]
                     .agg(["mean", "sem"]).reset_index()
@@ -316,37 +292,21 @@ with t5:
                 st.session_state.df_smp_updated = df_temp.merge(
                     stats, on=["Detector Name", "Condition", "Replicate"], how="left"
                 )
-
-                # --- デバッグ：RelQ が計算できた件数 ---
                 st.success("Relative quantification done.")
-                dbg = st.session_state.df_smp_updated.groupby("Detector Name")["Relative Quantity"].apply(
-                    lambda s: int(s.notna().sum())
-                )
-                st.caption("Non-NaN Relative Quantity count per detector")
-                st.write(dbg)
-
-        # プレビュー
         if st.session_state.get("df_smp_updated") is not None:
             st.dataframe(st.session_state.df_smp_updated.head(30), use_container_width=True)
 
-# 6) Export
+# 6) Export（PDF: 2in×2in グリッド & StandardカーブPDFも同梱 / UIにもプレビュー）
 with t6:
     if st.session_state.df_smp_updated is None:
-        st.info("まず 5) を実行してください。")
+        st.info("Please proceed with 5)")
     else:
-        import io, zipfile, math
-        import numpy as np
-        import pandas as pd
-        import matplotlib.pyplot as plt
-        from matplotlib.backends.backend_pdf import PdfPages
-        from sklearn.linear_model import LinearRegression
-        from sklearn.metrics import r2_score
-
+        import io, zipfile
         # ---- 日付入りベース名 ----
         today = pd.Timestamp.now().strftime("%Y-%m-%d")
         base_name = f"{today}qPCR_Results"
 
-        # ---- 描画ヘルパー（相対量：バー±SEM＋Rep黒ドット）----
+        # ---- 描画ヘルパー（相対量：バー±SEM(0.25pt)＋Rep黒ドット）----
         def draw_relq_panel(ax, ddf, conds):
             vals = ddf[["Condition","Replicate","Relative Quantity"]].dropna()
             if vals.empty:
@@ -369,7 +329,6 @@ with t6:
                 ax.set_axis_off()
                 return False
 
-            # 棒＋SEM（線の太さ=0.25pt）
             yerr = cond_stats["SEM"].to_numpy()
             ax.bar(
                 cond_stats["Condition"], cond_stats["Mean"],
@@ -377,7 +336,6 @@ with t6:
                 error_kw={"elinewidth": 0.25, "capthick": 0.25}
             )
 
-            # Repドット（黒塗り）
             cond_to_x = {c:i for i, c in enumerate(cond_stats["Condition"])}
             rep_offset = {"Rep1": -0.12, "Rep2": 0.0, "Rep3": 0.12}
             for _, row in rep_means.iterrows():
@@ -404,66 +362,45 @@ with t6:
         dets = st.session_state.df_smp_updated["Detector Name"].dropna().unique().tolist()
         conds = st.session_state.conditions
 
-        # ========= A) 相対量グリッド PDFを作成（同時にUI用のページ画像も作る）=========
+        # A) 相対量グリッド PDF + UIプレビュー
         relq_pdf_buf = io.BytesIO()
-        relq_page_pngs = []   # UIプレビュー用
-
+        relq_page_pngs = []
         with PdfPages(relq_pdf_buf) as pdf:
             panel_i = 0
-            axs = None
-            fig = None
-
+            fig = None; axs = None
             for det in dets:
                 if panel_i % (NCOLS*NROWS) == 0:
-                    # 既存ページを保存
                     if fig is not None:
-                        fig.tight_layout(pad=0.8)
-                        pdf.savefig(fig)
-                        # UI用PNGも同時生成
-                        buf_png = io.BytesIO()
-                        fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
-                        relq_page_pngs.append(buf_png.getvalue())
-                        plt.close(fig)
-                    # 新ページを作成
+                        fig.tight_layout(pad=0.8); pdf.savefig(fig)
+                        buf_png = io.BytesIO(); fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+                        relq_page_pngs.append(buf_png.getvalue()); plt.close(fig)
                     fig, ax_grid = plt.subplots(NROWS, NCOLS, figsize=(FIG_W, FIG_H))
                     axs = ax_grid.flatten()
 
                 ax = axs[panel_i % (NCOLS*NROWS)]
-                ddf = st.session_state.df_smp_updated[
-                    st.session_state.df_smp_updated["Detector Name"] == det
-                ].copy()
-                ok = draw_relq_panel(ax, ddf, conds)
+                ddf = st.session_state.df_smp_updated[st.session_state.df_smp_updated["Detector Name"]==det].copy()
+                draw_relq_panel(ax, ddf, conds)
                 ax.set_title(det, fontsize=9)
                 panel_i += 1
 
-            # 最終ページ
             if fig is not None:
                 used = panel_i % (NCOLS*NROWS) or (NCOLS*NROWS)
                 if used < (NCOLS*NROWS):
                     for k in range(used, NCOLS*NROWS):
                         axs[k].axis("off")
-                fig.tight_layout(pad=0.8)
-                pdf.savefig(fig)
-                buf_png = io.BytesIO()
-                fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
-                relq_page_pngs.append(buf_png.getvalue())
-                plt.close(fig)
+                fig.tight_layout(pad=0.8); pdf.savefig(fig)
+                buf_png = io.BytesIO(); fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+                relq_page_pngs.append(buf_png.getvalue()); plt.close(fig)
 
-        # ========= B) Standardカーブ PDF（同様にUI用ページ画像も）=========
+        # B) Standardカーブ PDF + UIプレビュー
         std_pdf_buf = io.BytesIO()
         std_page_pngs = []
-
         with PdfPages(std_pdf_buf) as pdf:
             if st.session_state.df_std_clean is not None and not st.session_state.df_std_clean.empty:
                 panel_i = 0
-                fig = None
-                axs = None
-
+                fig = None; axs = None
                 for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
-                    ddf = st.session_state.df_std_clean[
-                        st.session_state.df_std_clean["Detector Name"] == det
-                    ].copy()
-
+                    ddf = st.session_state.df_std_clean[st.session_state.df_std_clean["Detector Name"]==det].copy()
                     dwork = ddf.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct","Quantity"])
                     dwork = dwork[dwork["Quantity"] > 0]
                     if len(dwork) < 2:
@@ -477,18 +414,15 @@ with t6:
 
                     if panel_i % (NCOLS*NROWS) == 0:
                         if fig is not None:
-                            fig.tight_layout(pad=0.8)
-                            pdf.savefig(fig)
-                            buf_png = io.BytesIO()
-                            fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
-                            std_page_pngs.append(buf_png.getvalue())
-                            plt.close(fig)
+                            fig.tight_layout(pad=0.8); pdf.savefig(fig)
+                            buf_png = io.BytesIO(); fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+                            std_page_pngs.append(buf_png.getvalue()); plt.close(fig)
                         fig, ax_grid = plt.subplots(NROWS, NCOLS, figsize=(FIG_W, FIG_H))
                         axs = ax_grid.flatten()
 
                     ax = axs[panel_i % (NCOLS*NROWS)]
                     x = np.log10(dwork["Quantity"]); yv = dwork["Ct"]
-                    ax.scatter(x, yv, s=10, color="black")  # 散布図も黒
+                    ax.scatter(x, yv, s=10, color="black")
                     xx = np.linspace(x.min(), x.max(), 100).reshape(-1,1)
                     ax.plot(xx, model.predict(xx), "--", linewidth=0.8, color="black")
                     ax.set_title(f"{det}\nslope={slope:.3f}, R²={r2:.3f}", fontsize=8)
@@ -497,7 +431,6 @@ with t6:
                     ax.tick_params(labelsize=7)
                     for spine in ax.spines.values():
                         spine.set_linewidth(0.4)
-
                     panel_i += 1
 
                 if fig is not None:
@@ -505,18 +438,15 @@ with t6:
                     if used < (NCOLS*NROWS):
                         for k in range(used, NCOLS*NROWS):
                             axs[k].axis("off")
-                    fig.tight_layout(pad=0.8)
-                    pdf.savefig(fig)
-                    buf_png = io.BytesIO()
-                    fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
-                    std_page_pngs.append(buf_png.getvalue())
-                    plt.close(fig)
+                    fig.tight_layout(pad=0.8); pdf.savefig(fig)
+                    buf_png = io.BytesIO(); fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+                    std_page_pngs.append(buf_png.getvalue()); plt.close(fig)
 
-        # ========= C) CSV =========
+        # C) CSV
         buf_csv = io.StringIO()
         st.session_state.df_smp_updated.to_csv(buf_csv, index=False)
 
-        # ========= D) ZIP（相対量グリッドPDF + StandardカーブPDF + CSV） =========
+        # D) ZIP（相対量グリッドPDF + StandardカーブPDF + CSV）
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(f"{base_name}_grid2x2.pdf", relq_pdf_buf.getvalue())
@@ -530,17 +460,17 @@ with t6:
             mime="application/zip"
         )
 
-        # ========= E) UI プレビュー（PDFと同じページをPNGで表示；use_column_width互換）=========
+        # E) UI プレビュー（PDFと同じページをPNGで表示）
         st.subheader("📄 Relative expression (grid) preview")
         if relq_page_pngs:
             for i, png in enumerate(relq_page_pngs, start=1):
                 st.image(png, caption=f"RelQ grid page {i}", use_column_width=True)
         else:
-            st.info("RelQ grid に表示可能なページがありません。")
+            st.info("There are no pages available for display in the RelQ grid.")
 
         st.subheader("📄 Standard curves preview")
         if std_page_pngs:
             for i, png in enumerate(std_page_pngs, start=1):
                 st.image(png, caption=f"Standard curves page {i}", use_column_width=True)
         else:
-            st.info("Standard curves に表示可能なページがありません。")
+            st.info("There are no pages available for display in the Standard Curves section.")
