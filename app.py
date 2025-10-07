@@ -1,5 +1,5 @@
 import io, os, zipfile, warnings, csv
-import streamlit as st
+import streamlit as st       
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -97,22 +97,61 @@ if "df_raw" not in st.session_state:
 t1, t2, t3, t4, t5, t6 = st.tabs(["1) Upload", "2) Clean Standards", "3) Curves",
                                   "4) Assign", "5) Quantify", "6) Export"])
 
-# 1) Upload
+# 1) Upload  —— 複数ファイル対応版
 with t1:
-    up = st.file_uploader("📄 qPCRResultFile（TXT/TSV/CSV）", type=["txt","tsv","csv"])
-    if st.button("Load file") and up:
+    ups = st.file_uploader(
+        "📄 qPCR結果ファイルをアップロード（複数可 / TXT・TSV・CSV）",
+        type=["txt", "tsv", "csv"],
+        accept_multiple_files=True,
+        help="同じランの分割書き出しや別ファイルをまとめて読み込めます。"
+    )
+
+    if st.button("Load file(s)") and ups:
         try:
-            df = clean_dataframe_for_analysis(read_qpcr_textfile(up.read()))
-            st.session_state.df_raw = df.reset_index(drop=True)
-            st.success(f"Loaded rows: {len(df)}")
+            df_list = []
+            for up in ups:
+                # Bytes → DataFrame
+                df_tmp = read_qpcr_textfile(up.read())
+                df_tmp = clean_dataframe_for_analysis(df_tmp)
+                df_tmp["SourceFile"] = up.name  # どのファイル由来か残す
+                df_list.append(df_tmp)
+
+            if len(df_list) == 0:
+                st.warning("読み込めるファイルがありませんでした。")
+            else:
+                df = pd.concat(df_list, axis=0, ignore_index=True)
+                # 余計な全欠損行などの掃除（任意）
+                df = df.dropna(how="all").reset_index(drop=True)
+
+                st.session_state.df_raw = df
+                st.success(f"Loaded {len(ups)} file(s). Total rows = {len(df):,}")
+
         except Exception as e:
-            st.error(f"Failed reading: {e}")
+            st.error(f"failed_reading: {e}")
+
+    # プレビュー & 必須列チェック
     if st.session_state.df_raw is not None:
-        st.dataframe(st.session_state.df_raw.head(30), use_container_width=True)
-        need = {"Task","Ct","Detector Name"}
+        st.caption("preview_first30lines（最大30行）")
+        st.dataframe(
+            st.session_state.df_raw.head(30),
+            use_container_width=True
+        )
+
+        need = {"Task", "Ct", "Detector Name"}
         miss = [c for c in need if c not in st.session_state.df_raw.columns]
         if miss:
             st.error(f"必須列が不足: {miss}")
+        else:
+            # 参考情報
+            cols = ["Detector Name", "Task", "SourceFile"]
+            cols = [c for c in cols if c in st.session_state.df_raw.columns]
+            with st.expander("概要（Detector/Task/SourceFile）", expanded=False):
+                st.write(
+                    st.session_state.df_raw[cols]
+                    .drop_duplicates()
+                    .value_counts()
+                    .reset_index(name="count")
+                )
 
 # 2) Clean Standards
 with t2:
