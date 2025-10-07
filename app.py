@@ -1,5 +1,7 @@
+%%bash
+cat > app.py <<'PY'
 import io, os, zipfile, warnings, csv
-import streamlit as st       
+import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -97,61 +99,71 @@ if "df_raw" not in st.session_state:
 t1, t2, t3, t4, t5, t6 = st.tabs(["1) Upload", "2) Clean Standards", "3) Curves",
                                   "4) Assign", "5) Quantify", "6) Export"])
 
-# 1) Upload  —— 複数ファイル対応版
+# 1) Upload —— 複数ファイル対応版（安定化）
 with t1:
     ups = st.file_uploader(
         "📄 qPCR結果ファイルをアップロード（複数可 / TXT・TSV・CSV）",
         type=["txt", "tsv", "csv"],
         accept_multiple_files=True,
+        key="uploader_multi",
         help="同じランの分割書き出しや別ファイルをまとめて読み込めます。"
     )
 
-    if st.button("Load file(s)") and ups:
-        try:
+    col_l, col_r = st.columns([1,1])
+    load_clicked = col_l.button("Load file(s)")
+    clear_clicked = col_r.button("Clear")
+
+    if clear_clicked:
+        st.session_state.df_raw = None
+        st.experimental_rerun()
+
+    if load_clicked:
+        if not ups:
+            st.warning("ファイルが選ばれていません。")
+        else:
             df_list = []
+            errs = []
             for up in ups:
-                # Bytes → DataFrame
-                df_tmp = read_qpcr_textfile(up.read())
-                df_tmp = clean_dataframe_for_analysis(df_tmp)
-                df_tmp["SourceFile"] = up.name  # どのファイル由来か残す
-                df_list.append(df_tmp)
+                try:
+                    # バイト列を安全に取得（readよりgetvalueが堅牢）
+                    content_bytes = up.getvalue()
+                    df_tmp = read_qpcr_textfile(content_bytes)
+                    df_tmp = clean_dataframe_for_analysis(df_tmp)
+                    df_tmp["SourceFile"] = up.name
+                    df_list.append(df_tmp)
+                except Exception as e:
+                    errs.append(f"{up.name}: {e}")
 
-            if len(df_list) == 0:
-                st.warning("読み込めるファイルがありませんでした。")
-            else:
+            if errs:
+                st.error("一部のファイルで読み込みに失敗しました。詳細↓")
+                st.code("\n".join(errs))
+
+            if df_list:
                 df = pd.concat(df_list, axis=0, ignore_index=True)
-                # 余計な全欠損行などの掃除（任意）
                 df = df.dropna(how="all").reset_index(drop=True)
-
                 st.session_state.df_raw = df
-                st.success(f"Loaded {len(ups)} file(s). Total rows = {len(df):,}")
-
-        except Exception as e:
-            st.error(f"failed_reading: {e}")
+                st.success(f"Loaded {len(df_list)} file(s). Total rows = {len(df):,}")
+            else:
+                st.warning("読み込めるファイルがありませんでした。")
 
     # プレビュー & 必須列チェック
-    if st.session_state.df_raw is not None:
-        st.caption("preview_first30lines（最大30行）")
-        st.dataframe(
-            st.session_state.df_raw.head(30),
-            use_container_width=True
-        )
+    if st.session_state.get("df_raw") is not None:
+        st.caption("先頭プレビュー（最大30行）")
+        st.dataframe(st.session_state.df_raw.head(30), use_container_width=True)
 
         need = {"Task", "Ct", "Detector Name"}
         miss = [c for c in need if c not in st.session_state.df_raw.columns]
         if miss:
             st.error(f"必須列が不足: {miss}")
         else:
-            # 参考情報
-            cols = ["Detector Name", "Task", "SourceFile"]
-            cols = [c for c in cols if c in st.session_state.df_raw.columns]
-            with st.expander("概要（Detector/Task/SourceFile）", expanded=False):
-                st.write(
-                    st.session_state.df_raw[cols]
-                    .drop_duplicates()
-                    .value_counts()
-                    .reset_index(name="count")
-                )
+            cols = [c for c in ["Detector Name", "Task", "SourceFile"] if c in st.session_state.df_raw.columns]
+            if cols:
+                with st.expander("概要（Detector/Task/SourceFile）", expanded=False):
+                    st.write(
+                        st.session_state.df_raw[cols]
+                        .value_counts()
+                        .reset_index(name="count")
+                    )
 
 # 2) Clean Standards
 with t2:
@@ -513,3 +525,4 @@ with t6:
                 st.image(png, caption=f"Standard curves page {i}", use_column_width=True)
         else:
             st.info("There are no pages available for display in the Standard Curves section.")
+PY
