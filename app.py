@@ -1,5 +1,3 @@
-%%bash
-cat > app.py <<'PY'
 import io, os, zipfile, warnings, csv
 import streamlit as st
 import pandas as pd
