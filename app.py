@@ -523,4 +523,3 @@ with t6:
                 st.image(png, caption=f"Standard curves page {i}", use_column_width=True)
         else:
             st.info("There are no pages available for display in the Standard Curves section.")
-PY
