@@ -462,12 +462,12 @@ with t4:
 
                 st.success("Assignments saved.")
 
-# 5) Quantify（Undetectedは Quantity=0 として扱い、平均・SEM は 0 を除外）
+# 5) Quantify（Undetected は Quantity=0 として保持。ただし統計・描画では 0 を除外）
 with t5:
     if st.session_state.df_smp is None or st.session_state.df_std_clean is None:
         st.info("Please Complete 2) & 4)")
     else:
-        # --- Ct→Quantity（Ct欠損/Undetectedは 0 扱い） ---
+        # Ct → Quantity（Ct 欠損/Undetected は 0 扱い）
         def _ct_to_qty(ct, slope, intercept):
             if pd.isna(ct):
                 return 0.0
@@ -475,7 +475,7 @@ with t5:
                 return np.nan
             return float(10 ** ((ct - intercept) / slope))
 
-        # 1) 標準曲線から Unknown の Quantity を算出
+        # 1) 標準曲線から Quantity を付与
         df_smp = st.session_state.df_smp.copy()
         df_smp["Quantity"] = np.nan
 
@@ -489,7 +489,7 @@ with t5:
             dstd = dstd.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct", "Quantity"])
             dstd = dstd[dstd["Quantity"] > 0]
             if len(dstd) < 2:
-                st.warning(f"'{det}': Fewer than 2 standard points or Quantity ≤ 0. Skipping calculation.")
+                st.warning(f"'{det}': Standard curve calculation skipped: fewer than 2 standard points or Quantity ≤ 0.")
                 continue
 
             X = np.log10(dstd["Quantity"].to_numpy()).reshape(-1, 1)
@@ -501,10 +501,10 @@ with t5:
             df_smp.loc[rows_all, "Quantity"] = df_smp.loc[rows_all, "Ct"].apply(
                 lambda c: _ct_to_qty(c, slope, intercept)
             )
-            # 負の数量は無効
+            # 非物理値は NaN
             df_smp.loc[rows_all & (df_smp["Quantity"] < 0), "Quantity"] = np.nan
 
-        # 2) Control detector を選択し、Relative Quantity を計算
+        # 2) Control detector を選択して相対量を計算
         detectors_for_ctrl = sorted(df_smp["Detector Name"].dropna().unique().tolist())
         if not detectors_for_ctrl:
             st.error("Detector Name was not found. Please check Upload/Assign")
@@ -512,27 +512,31 @@ with t5:
             ctrl_det = st.selectbox("Control detector", detectors_for_ctrl, key="ctrl_det_select")
 
             if st.button("Run Relative Quantification"):
-                # Control 側（分母候補）
+                # Control の Quantity（分母候補）
                 ctrl_df = (
                     df_smp[df_smp["Detector Name"] == ctrl_det][["Condition", "Replicate", "Quantity"]]
                     .rename(columns={"Quantity": "Ctrl_Quantity"})
                     .copy()
                 )
-                # 分母が 0/NaN/負 は無効（ゼロ割回避）
-                ctrl_df.loc[(ctrl_df["Ctrl_Quantity"] <= 0) | (ctrl_df["Ctrl_Quantity"].isna()), "Ctrl_Quantity"] = np.nan
+                # 分母 0/NaN/負は無効（ゼロ割回避）
+                ctrl_df.loc[
+                    (ctrl_df["Ctrl_Quantity"].isna()) | (ctrl_df["Ctrl_Quantity"] <= 0),
+                    "Ctrl_Quantity"
+                ] = np.nan
 
-                # Condition 平均（fallback 用）
+                # Fallback: Condition 平均（>0 のみが平均に寄与）
                 ctrl_cond_mean = (
                     ctrl_df.groupby("Condition", as_index=False)["Ctrl_Quantity"]
                     .mean()
                     .rename(columns={"Ctrl_Quantity": "Ctrl_Cond_Mean"})
                 )
 
-                # 相対量を計算
+                # 作業テーブル
                 df_temp = df_smp.copy()
                 if "Relative Quantity" not in df_temp.columns:
                     df_temp["Relative Quantity"] = np.nan
 
+                # 各 Detector について相対量を計算（同一 Condition & Replicate を対応付け）
                 for det in df_temp["Detector Name"].dropna().unique():
                     mask = (df_temp["Detector Name"] == det)
                     ddet = (
@@ -543,16 +547,16 @@ with t5:
 
                     merged = ddet.merge(ctrl_df, on=["Condition", "Replicate"], how="left")
 
-                    # Control が見つからないところは Condition 平均で補完
+                    # Ctrl が欠けた行は Condition 平均で補完
                     if merged["Ctrl_Quantity"].isna().any():
                         merged = merged.merge(ctrl_cond_mean, on="Condition", how="left")
                         merged["Used_Ctrl"] = merged["Ctrl_Quantity"].fillna(merged["Ctrl_Cond_Mean"])
                     else:
                         merged["Used_Ctrl"] = merged["Ctrl_Quantity"]
 
-                    # 分母が無効（NaN/<=0）や分子が無効（NaN/負）は NaN
+                    # 分子も 0/NaN/負は無効（0 は「非検出」として除外）
                     invalid_den = merged["Used_Ctrl"].isna() | (merged["Used_Ctrl"] <= 0)
-                    invalid_num = merged["Quantity"].isna() | (merged["Quantity"] < 0)
+                    invalid_num = merged["Quantity"].isna() | (merged["Quantity"] <= 0)
 
                     merged["Relative Quantity"] = np.where(
                         invalid_den | invalid_num,
@@ -560,30 +564,45 @@ with t5:
                         merged["Quantity"] / merged["Used_Ctrl"]
                     )
 
-                    # 元の行へ書き戻し
+                    # 反映
                     df_temp.loc[merged["orig_index"], "Relative Quantity"] = merged["Relative Quantity"].values
 
-                # 3) ★テクニカルレプリケートの平均・SEM は 0 を除外★
-                #    （Undetected→0 はそのまま保持するが、平均/SEM の計算には入れない）
-                df_nonzero = df_temp[df_temp["Relative Quantity"] > 0].copy()
+                # ★ コントロール遺伝子は常に 1（Quantity>0 の行）。0/NaN行は NaN のまま
+                df_temp.loc[
+                    (df_temp["Detector Name"] == ctrl_det) & (df_temp["Quantity"] > 0),
+                    "Relative Quantity"
+                ] = 1.0
+
+                # 3) 技術反復（Replicate）レベルの平均・SEM を作成
+                #    → 0（非検出由来）は除外するため、Relative Quantity > 0 のみ採用
+                relq_valid = df_temp[["Detector Name", "Condition", "Replicate", "Relative Quantity"]].copy()
+                relq_valid = relq_valid.dropna(subset=["Relative Quantity"])
+                relq_valid = relq_valid[relq_valid["Relative Quantity"] > 0]
 
                 stats = (
-                    df_nonzero
-                    .groupby(["Detector Name", "Condition", "Replicate"], observed=False)["Relative Quantity"]
-                    .agg(["mean", "sem"])
+                    relq_valid.groupby(["Detector Name", "Condition", "Replicate"], observed=False)["Relative Quantity"]
+                    .agg(RelQ_Mean="mean",
+                         RelQ_SEM=lambda s: s.std(ddof=1) / np.sqrt(s.count()) if s.count() > 1 else 0.0)
                     .reset_index()
-                    .rename(columns={"mean": "RelQ_Mean", "sem": "RelQ_SEM"})
                 )
 
+                # 元にマージ（無効セルは RelQ_Mean/SEM が欠損のまま）
                 st.session_state.df_smp_updated = df_temp.merge(
                     stats, on=["Detector Name", "Condition", "Replicate"], how="left"
                 )
 
                 st.success("Relative quantification done.")
+                # 参考：非 NaN の相対量カウント
+                dbg = st.session_state.df_smp_updated.groupby("Detector Name")["Relative Quantity"].apply(
+                    lambda s: int(s.notna().sum())
+                )
+                st.caption("Non-NaN Relative Quantity count per detector")
+                st.write(dbg)
 
         # プレビュー
         if st.session_state.get("df_smp_updated") is not None:
             st.dataframe(st.session_state.df_smp_updated.head(30), use_container_width=True)
+
 # 6) Export（PDF: 2in×2in グリッド & StandardカーブPDFも同梱 / UIにもプレビュー）
 with t6:
     if st.session_state.df_smp_updated is None:
