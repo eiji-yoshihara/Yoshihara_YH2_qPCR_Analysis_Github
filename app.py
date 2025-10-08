@@ -219,34 +219,175 @@ with t4:
     if st.session_state.df_raw is None:
         st.info("Please Complete Upload")
     else:
-        df_smp = st.session_state.df_raw.copy()
-        df_smp = df_smp[df_smp["Task"].astype(str).str.lower()=="unknown"].copy()
-        if df_smp.empty:
-            st.warning("NoUnknown")
+        # ---- 元データ（Unknown のみ）を整える ----
+        work = st.session_state.df_raw.copy()
+        work = work[work["Task"].astype(str).str.lower() == "unknown"].copy()
+
+        # 並び順：Detector→Well（数値にできる場合）
+        if "Well" in work.columns:
+            work["Well"] = pd.to_numeric(work["Well"], errors="coerce")
+            work = work.sort_values(["Detector Name", "Well"], na_position="last").reset_index(drop=False)
+            # 'index' 列が元のインデックス（この番号で assign_df を管理）
+            base_index = work["index"].to_list()
         else:
-            st.session_state.conditions = st.text_area(
-                "Conditions (1行に1つ)", value="\n".join(st.session_state.conditions), height=100
-            ).splitlines()
-            st.session_state.conditions = [c.strip() for c in st.session_state.conditions if c.strip()]
-            df_smp = df_smp.sort_values(["Detector Name","Well"], na_position="last").reset_index(drop=True)
-            if "Condition" not in df_smp.columns: df_smp["Condition"] = ""
-            if "Replicate" not in df_smp.columns: df_smp["Replicate"] = ""
-            edited = st.data_editor(
-                df_smp[["Detector Name","Sample Name","Ct","Condition","Replicate"]],
-                column_config={
-                    "Condition": st.column_config.SelectboxColumn(options=st.session_state.conditions),
-                    "Replicate": st.column_config.SelectboxColumn(options=["Rep1","Rep2","Rep3"])
-                },
-                use_container_width=True, num_rows="fixed", key="assign_editor"
-            )
-            if st.button("Save assignment"):
-                df_smp.loc[:, ["Condition","Replicate"]] = edited[["Condition","Replicate"]].values
-                missing = df_smp[(df_smp["Condition"]=="") | (df_smp["Replicate"]=="")]
-                if not missing.empty:
-                    st.error(f"{len(missing)} samples missing assignment.")
-                else:
-                    st.session_state.df_smp = df_smp
-                    st.success("Assignments saved.")
+            work = work.sort_values(["Detector Name"]).reset_index(drop=False)
+            base_index = work["index"].to_list()
+
+        # ---- セッション側の割り当てテーブル（Condition/Replicate）を用意 ----
+        if "assign_df" not in st.session_state:
+            st.session_state.assign_df = pd.DataFrame(index=st.session_state.df_raw.index)
+            st.session_state.assign_df["Condition"] = ""
+            st.session_state.assign_df["Replicate"] = ""
+        # Detector テンプレ用
+        if "detector_template" not in st.session_state:
+            st.session_state.detector_template = None
+
+        # ---- Condition 候補を編集 ----
+        st.subheader("Define conditions")
+        cond_text = st.text_area(
+            "Conditions (1行に1つ)",
+            value="\n".join(st.session_state.get("conditions", ["Control", "Treatment1", "Treatment2"])),
+            height=100,
+            help="ここで候補を編集すると下のセレクトボックスにも反映されます。"
+        )
+        st.session_state.conditions = [c.strip() for c in cond_text.splitlines() if c.strip()]
+
+        st.markdown("---")
+
+        # ---- Detector ごとの割り当て UI ----
+        for det in sorted(work["Detector Name"].dropna().unique().tolist()):
+            with st.expander(f"Detector: {det}", expanded=False):
+                sub = work[work["Detector Name"] == det].copy().reset_index(drop=True)
+                # sub には 'index' 列（元 df_raw の行番号）がある
+
+                # ====== フィルター（Sample 名 / Well / Ct） ======
+                f1, f2, f3 = st.columns([2, 1, 1])
+                with f1:
+                    q = st.text_input("Filter (Sample/Well/Ct 部分一致)", key=f"q_{det}").strip()
+                with f2:
+                    hide_nan = st.checkbox("Ct NaN を隠す", value=False, key=f"nan_{det}")
+                with f3:
+                    st.caption(f"Rows in this detector: {len(sub)}")
+
+                filt = np.ones(len(sub), dtype=bool)
+                if q:
+                    qlow = q.lower()
+                    filt &= (
+                        sub["Sample Name"].astype(str).str.lower().str.contains(qlow) |
+                        sub.get("Well", pd.Series([""] * len(sub))).astype(str).str.lower().str.contains(qlow) |
+                        sub.get("Ct", pd.Series([""] * len(sub))).astype(str).str.lower().str.contains(qlow)
+                    )
+                if hide_nan and "Ct" in sub.columns:
+                    filt &= sub["Ct"].notna()
+
+                view = sub.loc[filt].copy()
+
+                # ====== 対象行の複数選択 & 全選択 ======
+                st.caption("Select samples to apply")
+                # 表示ラベルと元インデックス（df_raw の行番号）をペアに
+                options = [
+                    (
+                        f"{r['Sample Name']} (Well={'' if pd.isna(r.get('Well')) else int(r.get('Well')) if float(r.get('Well')).is_integer() else r.get('Well')}, Ct={r.get('Ct')})",
+                        int(r["index"])
+                    )
+                    for _, r in view.iterrows()
+                ]
+                sel_key = f"ms_{det}"
+                selected = st.multiselect(
+                    "Samples",
+                    [v for (_, v) in options],
+                    format_func=lambda idx: next(lbl for (lbl, v) in options if v == idx),
+                    key=sel_key
+                )
+
+                csel1, csel2 = st.columns([1, 1])
+                if csel1.button("Select all (filtered)", key=f"selall_{det}"):
+                    st.session_state[sel_key] = [v for (_, v) in options]
+                    st.experimental_rerun()
+                if csel2.button("Clear selection", key=f"selclr_{det}"):
+                    st.session_state[sel_key] = []
+                    st.experimental_rerun()
+
+                # ====== Condition / Replicate を選び、選択行 or 全行に適用 ======
+                c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+                with c1:
+                    pick_cond = st.selectbox("Condition", st.session_state.conditions, key=f"cond_{det}")
+                with c2:
+                    pick_rep = st.selectbox("Bio Rep", ["Rep1", "Rep2", "Rep3"], key=f"rep_{det}")
+                with c3:
+                    apply_clicked = st.button("Apply to selected", key=f"apply_{det}")
+                with c4:
+                    apply_all_clicked = st.button("Apply to ALL in this detector", key=f"applyall_{det}")
+
+                if apply_clicked:
+                    if not selected:
+                        st.warning("No sample selected.")
+                    else:
+                        st.session_state.assign_df.loc[selected, ["Condition", "Replicate"]] = [pick_cond, pick_rep]
+                        st.success(f"Applied to {len(selected)} row(s).")
+
+                if apply_all_clicked:
+                    locs = sub["index"].to_list()
+                    st.session_state.assign_df.loc[locs, ["Condition", "Replicate"]] = [pick_cond, pick_rep]
+                    st.success(f"Applied to ALL {len(locs)} row(s) in '{det}'.")
+
+                # ====== Detector テンプレ（サイズ一致時のみ貼付け） ======
+                t1, t2 = st.columns([1, 1])
+                if t1.button("Copy as template", key=f"copy_{det}"):
+                    templ = st.session_state.assign_df.loc[sub["index"], ["Condition", "Replicate"]].copy().reset_index(drop=True)
+                    st.session_state.detector_template = templ
+                    st.success(f"Template copied from '{det}' ({len(templ)} rows).")
+
+                if t2.button("Use the template", key=f"paste_{det}"):
+                    templ = st.session_state.detector_template
+                    tgt = st.session_state.assign_df.loc[sub["index"], ["Condition", "Replicate"]].copy().reset_index(drop=True)
+                    if templ is None:
+                        st.warning("No template copied yet.")
+                    elif len(templ) != len(tgt):
+                        st.warning(f"Template size mismatch: template={len(templ)} vs target={len(tgt)}")
+                    else:
+                        st.session_state.assign_df.loc[sub["index"], ["Condition", "Replicate"]] = templ.values
+                        st.success(f"Template applied to '{det}'.")
+
+                # ====== プレビュー（現在の割当てを反映した表） ======
+                st.caption("Updated table (after operations)")
+                sub_preview = work[work["Detector Name"] == det][["index", "Sample Name", "Ct"]].copy()
+                sub_preview["Condition"] = st.session_state.assign_df.loc[sub_preview["index"], "Condition"].values
+                sub_preview["Replicate"] = st.session_state.assign_df.loc[sub_preview["index"], "Replicate"].values
+                sub_preview = sub_preview.drop(columns=["index"])
+                st.dataframe(sub_preview, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ---- 保存（検証してセッションへ確定） ----
+        if st.button("Save assignment", type="primary", key="save_assign"):
+            assigned = st.session_state.assign_df.copy()
+            # Unknown 対象だけを抽出
+            target_idx = st.session_state.df_raw.index[
+                st.session_state.df_raw["Task"].astype(str).str.lower() == "unknown"
+            ]
+            # 必須チェック
+            missing_mask = (assigned.loc[target_idx, "Condition"] == "") | (assigned.loc[target_idx, "Replicate"] == "")
+            if missing_mask.any():
+                miss_count = int(missing_mask.sum())
+                st.error(f"{miss_count} samples missing assignment (Condition or Replicate).")
+            else:
+                # 元データに列が無ければ作る
+                if "Condition" not in st.session_state.df_raw.columns:
+                    st.session_state.df_raw["Condition"] = ""
+                if "Replicate" not in st.session_state.df_raw.columns:
+                    st.session_state.df_raw["Replicate"] = ""
+
+                # 反映
+                st.session_state.df_raw.loc[:, "Condition"] = assigned["Condition"].fillna(st.session_state.df_raw["Condition"])
+                st.session_state.df_raw.loc[:, "Replicate"] = assigned["Replicate"].fillna(st.session_state.df_raw["Replicate"])
+
+                # 後続タブで使う Unknown の完成版を保存
+                st.session_state.df_smp = st.session_state.df_raw[
+                    st.session_state.df_raw["Task"].astype(str).str.lower() == "unknown"
+                ].copy()
+
+                st.success("Assignments saved.")
 
 # 5) Quantify（Undetectedは Quantity=0 として扱い、SEMで描画）
 with t5:
@@ -264,6 +405,7 @@ with t5:
         df_smp = st.session_state.df_smp.copy()
         df_smp["Quantity"] = np.nan
 
+        # 標準曲線から Unknown の Quantity を計算
         for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
             dstd = st.session_state.df_std_clean[
                 (st.session_state.df_std_clean["Detector Name"] == det) &
@@ -286,6 +428,7 @@ with t5:
             )
             df_smp.loc[rows_all & (df_smp["Quantity"] < 0), "Quantity"] = np.nan
 
+        # コントロール遺伝子選択
         detectors_for_ctrl = sorted(df_smp["Detector Name"].dropna().unique().tolist())
         if not detectors_for_ctrl:
             st.error("Detector Name was not found. Please check Upload/Assign")
@@ -293,30 +436,43 @@ with t5:
             ctrl_det = st.selectbox("Control detector", detectors_for_ctrl, key="ctrl_det_select")
 
             if st.button("Run Relative Quantification"):
+                # Ctrl の Quantity を準備（行対応のため index を持たせる）
                 ctrl_df = (
                     df_smp[df_smp["Detector Name"] == ctrl_det][["Condition", "Replicate", "Quantity"]]
                     .rename(columns={"Quantity": "Ctrl_Quantity"})
                     .copy()
                 )
+                # 無効な Ctrl は NaN に統一
                 ctrl_df.loc[(ctrl_df["Ctrl_Quantity"] <= 0) | (ctrl_df["Ctrl_Quantity"].isna()), "Ctrl_Quantity"] = np.nan
 
+                # Condition ごとの Ctrl 平均（フォールバック）
                 ctrl_cond_mean = (
                     ctrl_df.groupby("Condition", as_index=False)["Ctrl_Quantity"]
                     .mean()
                     .rename(columns={"Ctrl_Quantity": "Ctrl_Cond_Mean"})
                 )
 
+                # 相対量作業テーブル
                 df_temp = df_smp.copy()
                 if "Relative Quantity" not in df_temp.columns:
                     df_temp["Relative Quantity"] = np.nan
 
                 for det in df_temp["Detector Name"].dropna().unique():
-                    mask = df_temp["Detector Name"] == det
+                    mask = (df_temp["Detector Name"] == det)
                     ddet = (
                         df_temp.loc[mask, ["Condition", "Replicate", "Quantity"]]
                         .reset_index()
                         .rename(columns={"index": "orig_index"})
                     )
+
+                    # ★ コントロール遺伝子は常に 1.0（有効なデータのみ）
+                    if det == ctrl_det:
+                        q_valid = ddet["Quantity"].notna() & (ddet["Quantity"] >= 0)
+                        df_temp.loc[ddet.loc[q_valid, "orig_index"], "Relative Quantity"] = 1.0
+                        # 無効値（NaN, 負値）は NaN のまま
+                        continue
+
+                    # それ以外の遺伝子は、対応する Ctrl → 無ければ Condition 平均で割る
                     merged = ddet.merge(ctrl_df, on=["Condition","Replicate"], how="left")
                     if merged["Ctrl_Quantity"].isna().any():
                         merged = merged.merge(ctrl_cond_mean, on="Condition", how="left")
@@ -331,8 +487,10 @@ with t5:
                         np.nan,
                         merged["Quantity"] / merged["Used_Ctrl"]
                     )
+
                     df_temp.loc[merged["orig_index"], "Relative Quantity"] = merged["Relative Quantity"].values
 
+                # Mean/SEM を付与
                 stats = (
                     df_temp.groupby(["Detector Name", "Condition", "Replicate"], observed=False)["Relative Quantity"]
                     .agg(["mean", "sem"]).reset_index()
@@ -342,6 +500,7 @@ with t5:
                     stats, on=["Detector Name", "Condition", "Replicate"], how="left"
                 )
                 st.success("Relative quantification done.")
+
         if st.session_state.get("df_smp_updated") is not None:
             st.dataframe(st.session_state.df_smp_updated.head(30), use_container_width=True)
 
