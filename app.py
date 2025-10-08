@@ -100,11 +100,11 @@ t1, t2, t3, t4, t5, t6 = st.tabs(["1) Upload", "2) Clean Standards", "3) Curves"
 # 1) Upload —— 複数ファイル対応版（安定化）
 with t1:
     ups = st.file_uploader(
-        "📄 qPCR結果ファイルをアップロード（複数可 / TXT・TSV・CSV）",
+        "📄 Upload qPCR result files (multiple files allowed / TXT, TSV, CSV formats)",
         type=["txt", "tsv", "csv"],
         accept_multiple_files=True,
         key="uploader_multi",
-        help="同じランの分割書き出しや別ファイルをまとめて読み込めます。"
+        help="You can export a split from the same run or load multiple files together."
     )
 
     col_l, col_r = st.columns([1,1])
@@ -117,7 +117,7 @@ with t1:
 
     if load_clicked:
         if not ups:
-            st.warning("ファイルが選ばれていません。")
+            st.warning("No file selected.")
         else:
             df_list = []
             errs = []
@@ -133,7 +133,7 @@ with t1:
                     errs.append(f"{up.name}: {e}")
 
             if errs:
-                st.error("一部のファイルで読み込みに失敗しました。詳細↓")
+                st.error("Failed to load some of the files. See details below.↓")
                 st.code("\n".join(errs))
 
             if df_list:
@@ -142,77 +142,150 @@ with t1:
                 st.session_state.df_raw = df
                 st.success(f"Loaded {len(df_list)} file(s). Total rows = {len(df):,}")
             else:
-                st.warning("読み込めるファイルがありませんでした。")
+                st.warning("No files could be read or recognized.")
 
     # プレビュー & 必須列チェック
     if st.session_state.get("df_raw") is not None:
-        st.caption("先頭プレビュー（最大30行）")
+        st.caption("Preview of the beginning (up to 30 lines)")
         st.dataframe(st.session_state.df_raw.head(30), use_container_width=True)
 
         need = {"Task", "Ct", "Detector Name"}
         miss = [c for c in need if c not in st.session_state.df_raw.columns]
         if miss:
-            st.error(f"必須列が不足: {miss}")
+            st.error(f"Required column(s) missing: {miss}")
         else:
             cols = [c for c in ["Detector Name", "Task", "SourceFile"] if c in st.session_state.df_raw.columns]
             if cols:
-                with st.expander("概要（Detector/Task/SourceFile）", expanded=False):
+                with st.expander("Summary（Detector/Task/SourceFile）", expanded=False):
                     st.write(
                         st.session_state.df_raw[cols]
                         .value_counts()
                         .reset_index(name="count")
                     )
 
-# 2) Clean Standards
+# 2) Clean Standards（各(Detector, Quantity)ごとに行チェック→削除）
 with t2:
     if st.session_state.df_raw is None:
         st.info("Please Complete Upload")
     else:
+        # --- 元データ整形 ---
         df_std = st.session_state.df_raw.copy()
-        df_std = df_std[df_std["Task"].astype(str).str.lower()=="standard"].dropna(subset=["Ct"]).copy()
-        if "Well" in df_std.columns: df_std["Well"] = pd.to_numeric(df_std["Well"], errors="coerce")
-        df_std = df_std.sort_values(["Detector Name","Quantity","Well"], na_position="last")
-        drops = []
-        for (det, qty), sub in df_std.groupby(["Detector Name","Quantity"], dropna=False):
-            st.markdown(f"**{det} — Qty {qty}**  (ΔCt={sub['Ct'].max()-sub['Ct'].min():.2f})")
-            show = sub[["Well","Sample Name","Ct"]].reset_index()
-            idxs = st.multiselect("Drop rows", options=show["index"].tolist(),
-                                  format_func=lambda i: f"Well {int(df_std.loc[i,'Well']) if pd.notna(df_std.loc[i,'Well']) else '?'} / {df_std.loc[i,'Sample Name']} (Ct={df_std.loc[i,'Ct']})",
-                                  key=f"drop_{det}_{qty}")
-            drops += idxs
-            st.dataframe(show.drop(columns=["index"]), use_container_width=True)
-        if st.button("Apply cleaning"):
-            clean = df_std.drop(index=drops).reset_index(drop=True)
-            st.session_state.df_std_clean = clean
-            st.success(f"Cleaned: {len(df_std)} → {len(clean)} rows")
-        if st.session_state.df_std_clean is not None:
-            st.dataframe(st.session_state.df_std_clean.head(20), use_container_width=True)
+        df_std = df_std[
+            df_std["Task"].astype(str).str.lower() == "standard"
+        ].dropna(subset=["Ct"]).copy()
 
-# 3) Standard Curves
+        if "Well" in df_std.columns:
+            # 数値化（失敗はNaNのまま）
+            df_std["Well"] = pd.to_numeric(df_std["Well"], errors="coerce")
+
+        # 表示順
+        df_std = df_std.sort_values(["Detector Name", "Quantity", "Well"], na_position="last")
+
+        # --- 各グループごとに expander でチェックボックス表示 ---
+        drops = []  # 削除する index を集める
+        for (det, qty), sub in df_std.groupby(["Detector Name", "Quantity"], dropna=False):
+            ct_min, ct_max = sub["Ct"].min(), sub["Ct"].max()
+            diff = float(ct_max - ct_min) if pd.notna(ct_min) and pd.notna(ct_max) else np.nan
+
+            title = f"{det} : Quantity {qty}"
+            if pd.notna(diff) and diff >= 1.5:
+                title = f"⚠️ {title} (ΔCt={diff:.2f})"
+
+            with st.expander(title, expanded=False):
+                st.caption("Please check the row(s) you would like to delete")
+                # 行ごとのチェックボックス
+                sub_show = sub.reset_index()  # 'index' 列 = 元の行 index
+                cols_to_show = ["Well", "Sample Name", "Ct"]
+                st.dataframe(sub_show[cols_to_show + ["index"]].rename(columns={"index": "row_id"}),
+                             use_container_width=True)
+
+                # チェックボックスを縦に並べる（IDは元 index）
+                for _, row in sub_show.iterrows():
+                    lbl = f"{row.get('Sample Name','?')} (Ct={row.get('Ct')})"
+                    ck_key = f"std_ck_{det}_{qty}_{int(row['index'])}"
+                    checked = st.checkbox(lbl, key=ck_key, value=False)
+                    if checked:
+                        drops.append(int(row["index"]))
+
+        # --- 確定ボタン ---
+        if st.button("Apply cleaning", type="primary"):
+            clean = df_std.drop(index=list(set(drops))).reset_index(drop=True)
+            st.session_state.df_std_clean = clean
+            st.success(f"Cleaned: {len(df_std)} → {len(clean)} rows "
+                       f"({len(set(drops))} row(s) removed)")
+        # プレビュー
+        if st.session_state.get("df_std_clean") is not None:
+            st.dataframe(st.session_state.df_std_clean.head(40), use_container_width=True)
+
+# 3) Standard Curves（堅牢版：Quantity>0 & finite のみ使用、標準点>=2）
 with t3:
-    if st.session_state.df_std_clean is None:
+    if st.session_state.get("df_std_clean") is None:
         st.info("2) Please do Clean Standards")
     else:
         buf_pdf = io.BytesIO()
         with PdfPages(buf_pdf) as pdf:
+
+            # 既存のクリーン標準データから Detector ごとに作図
             for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
-                ddf = st.session_state.df_std_clean[st.session_state.df_std_clean["Detector Name"]==det]
-                sc = compute_standard_curve(ddf)
-                fig, ax = plt.subplots(figsize=(5,3.2))
+                raw = st.session_state.df_std_clean.copy()
+
+                # 念のため Standard のみ・Ct/Quantity の有限値のみ・Quantity>0 に限定
+                ddf = raw[raw["Detector Name"] == det].copy()
+                ddf = ddf.replace([np.inf, -np.inf], np.nan)
+                ddf = ddf.dropna(subset=["Ct", "Quantity"])
+                ddf = ddf[ddf["Quantity"] > 0]
+
+                fig, ax = plt.subplots(figsize=(6, 4))
                 ax.set_title(f"Standard curve: {det}")
-                ax.set_xlabel("log10(Quantity)"); ax.set_ylabel("Ct")
-                if sc:
-                    x = np.log10(ddf["Quantity"]); y = ddf["Ct"]
-                    ax.scatter(x,y, color="black", s=12)
-                    xx = np.linspace(x.min(), x.max(), 100).reshape(-1,1)
-                    ax.plot(xx, sc["model"].predict(xx), "--", linewidth=0.8, color="black")
-                    ax.text(0.02,0.02,f"slope={sc['slope']:.3f}\nR²={sc['r2']:.3f}", transform=ax.transAxes)
+                ax.set_xlabel("log10(Quantity)")
+                ax.set_ylabel("Ct")
+
+                if len(ddf) >= 2:
+                    try:
+                        x = np.log10(ddf["Quantity"].to_numpy())
+                        y = ddf["Ct"].to_numpy()
+
+                        # 可視化（散布図）
+                        ax.scatter(x, y, s=16, label="Data")
+
+                        # 線形回帰
+                        X = x.reshape(-1, 1)
+                        model = LinearRegression().fit(X, y)
+                        yhat = model.predict(X)
+                        r2 = r2_score(y, yhat)
+                        slope = float(model.coef_[0])
+                        intercept = float(model.intercept_)
+
+                        # フィット線
+                        xx = np.linspace(x.min(), x.max(), 100).reshape(-1, 1)
+                        yy = model.predict(xx)
+                        ax.plot(xx.ravel(), yy, "--", linewidth=1.2, label="Fit")
+
+                        # テキスト情報
+                        ax.text(
+                            0.02, 0.02,
+                            f"n={len(ddf)}\nslope={slope:.3f}\nR²={r2:.3f}",
+                            transform=ax.transAxes,
+                            ha="left", va="bottom"
+                        )
+
+                        ax.legend(loc="best", fontsize=8)
+                    except Exception as e:
+                        ax.text(0.5, 0.5, f"Error in fit: {e}", ha="center")
                 else:
-                    ax.text(0.5,0.5,"Insufficient points", ha="center")
-                st.pyplot(fig, clear_figure=True); pdf.savefig(fig); plt.close(fig)
-        st.download_button("📄 Download standard-curve report (PDF)",
-                           data=buf_pdf.getvalue(), file_name="qpcr_standard_curve_report.pdf",
-                           mime="application/pdf")
+                    ax.text(0.5, 0.5, "Insufficient standard points (n < 2)", ha="center")
+
+                plt.tight_layout()
+                st.pyplot(fig, clear_figure=True)
+                pdf.savefig(fig)
+                plt.close(fig)
+
+        st.download_button(
+            "📄 Download standard-curve report (PDF)",
+            data=buf_pdf.getvalue(),
+            file_name="qpcr_standard_curve_report.pdf",
+            mime="application/pdf",
+        )
 
 # 4) Assign
 with t4:
@@ -248,7 +321,7 @@ with t4:
             "Conditions (1行に1つ)",
             value="\n".join(st.session_state.get("conditions", ["Control", "Treatment1", "Treatment2"])),
             height=100,
-            help="ここで候補を編集すると下のセレクトボックスにも反映されます。"
+            help="Editing the options here will also update the selections in the dropdown box below."
         )
         st.session_state.conditions = [c.strip() for c in cond_text.splitlines() if c.strip()]
 
@@ -414,7 +487,7 @@ with t5:
             dstd = dstd.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct","Quantity"])
             dstd = dstd[dstd["Quantity"] > 0]
             if len(dstd) < 2:
-                st.warning(f"'{det}': 標準点が2点未満または Quantity<=0。計算スキップ。")
+                st.warning(f"'{det}': Fewer than 2 standard points or Quantity ≤ 0. Skipping calculation.")
                 continue
 
             X = np.log10(dstd["Quantity"].to_numpy()).reshape(-1, 1)
