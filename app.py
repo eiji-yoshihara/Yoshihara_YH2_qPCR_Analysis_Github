@@ -7,8 +7,8 @@ from matplotlib.backends.backend_pdf import PdfPages
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 
-st.set_page_config(page_title="Yoshihara Lab SOP Software YH#2 qPCR_Analysis_v0.1.2", layout="wide")
-st.title("🧬 Yoshihara Lab SOP Software YH#2 qPCR_Analysis_v0.1.2")
+st.set_page_config(page_title="Yoshihara Lab SOP Software YH#2 qPCR_Analysis_v0.2.1", layout="wide")
+st.title("🧬 Yoshihara Lab SOP Software YH#2 qPCR_Analysis_v0.2.1")
 
 # ---------- Core helpers ----------
 def read_qpcr_textfile(content_bytes: bytes) -> pd.DataFrame:
@@ -221,34 +221,193 @@ with t4:
     if st.session_state.df_raw is None:
         st.info("Please Complete Upload")
     else:
-        df_smp = st.session_state.df_raw.copy()
-        df_smp = df_smp[df_smp["Task"].astype(str).str.lower()=="unknown"].copy()
-        if df_smp.empty:
-            st.warning("No 'Unknown' samples were found in the uploaded data.")
+        # ---- Build working table: Unknown only ----
+        work = st.session_state.df_raw.copy()
+        work = work[work["Task"].astype(str).str.lower() == "unknown"].copy()
+
+        # Sort: Detector -> Well (numeric if possible)
+        if "Well" in work.columns:
+            work["Well"] = pd.to_numeric(work["Well"], errors="coerce")
+            work = work.sort_values(["Detector Name", "Well"], na_position="last").reset_index(drop=False)
+            base_index = work["index"].to_list()  # original df_raw indices
         else:
-            st.session_state.conditions = st.text_area(
-                "Conditions (one per line)", value="\n".join(st.session_state.conditions), height=100
-            ).splitlines()
-            st.session_state.conditions = [c.strip() for c in st.session_state.conditions if c.strip()]
-            df_smp = df_smp.sort_values(["Detector Name","Well"], na_position="last").reset_index(drop=True)
-            if "Condition" not in df_smp.columns: df_smp["Condition"] = ""
-            if "Replicate" not in df_smp.columns: df_smp["Replicate"] = ""
-            edited = st.data_editor(
-                df_smp[["Detector Name","Sample Name","Ct","Condition","Replicate"]],
-                column_config={
-                    "Condition": st.column_config.SelectboxColumn(options=st.session_state.conditions),
-                    "Replicate": st.column_config.SelectboxColumn(options=["Rep1","Rep2","Rep3"])
-                },
-                use_container_width=True, num_rows="fixed", key="assign_editor"
-            )
-            if st.button("Save assignment"):
-                df_smp.loc[:, ["Condition","Replicate"]] = edited[["Condition","Replicate"]].values
-                missing = df_smp[(df_smp["Condition"]=="") | (df_smp["Replicate"]=="")]
-                if not missing.empty:
-                    st.error(f"{len(missing)} samples missing assignment.")
-                else:
-                    st.session_state.df_smp = df_smp
-                    st.success("Assignments saved.")
+            work = work.sort_values(["Detector Name"]).reset_index(drop=False)
+            base_index = work["index"].to_list()
+
+        # ---- Session assignment table (Condition/Replicate) ----
+        if "assign_df" not in st.session_state:
+            st.session_state.assign_df = pd.DataFrame(index=st.session_state.df_raw.index)
+            st.session_state.assign_df["Condition"] = ""
+            st.session_state.assign_df["Replicate"] = ""
+
+        # Detector-level template store
+        if "detector_template" not in st.session_state:
+            st.session_state.detector_template = None
+
+        # ---- Conditions editor ----
+        st.subheader("Define conditions")
+        cond_text = st.text_area(
+            "One condition per line",
+            value="\n".join(st.session_state.get("conditions", ["Control", "Treatment1", "Treatment2"])),
+            height=100,
+            help="Editing here updates the select boxes below."
+        )
+        st.session_state.conditions = [c.strip() for c in cond_text.splitlines() if c.strip()]
+
+        st.markdown("---")
+
+        # ---- Per-detector assignment UI ----
+        for det in sorted(work["Detector Name"].dropna().unique().tolist()):
+            with st.expander(f"Detector: {det}", expanded=False):
+                sub = work[work["Detector Name"] == det].copy().reset_index(drop=True)  # has 'index' (df_raw row id)
+
+                # ====== Filter (Sample/Well/Ct) ======
+                f1, f2, f3 = st.columns([2, 1, 1])
+                with f1:
+                    q = st.text_input("Filter (partial match for Sample/Well/Ct)", key=f"q_{det}").strip()
+                with f2:
+                    hide_nan = st.checkbox("Hide Ct NaN", value=False, key=f"nan_{det}")
+                with f3:
+                    st.caption(f"Rows in this detector: {len(sub)}")
+
+                filt = np.ones(len(sub), dtype=bool)
+                if q:
+                    qlow = q.lower()
+                    filt &= (
+                        sub["Sample Name"].astype(str).str.lower().str.contains(qlow) |
+                        sub.get("Well", pd.Series([""] * len(sub))).astype(str).str.lower().str.contains(qlow) |
+                        sub.get("Ct", pd.Series([""] * len(sub))).astype(str).str.lower().str.contains(qlow)
+                    )
+                if hide_nan and "Ct" in sub.columns:
+                    filt &= sub["Ct"].notna()
+
+                view = sub.loc[filt].copy()
+
+                # ====== Multi-select target rows ======
+                st.caption("Select samples to apply")
+                # display label + original df_raw index as value
+                options = []
+                for _, r in view.iterrows():
+                    well_val = r.get("Well")
+                    if pd.isna(well_val):
+                        well_str = ""
+                    else:
+                        try:
+                            w = float(well_val)
+                            well_str = str(int(w)) if w.is_integer() else str(well_val)
+                        except Exception:
+                            well_str = str(well_val)
+                    label = f"{r['Sample Name']} (Well={well_str}, Ct={r.get('Ct')})"
+                    options.append((label, int(r["index"])))
+
+                sel_key = f"ms_{det}"
+                selected = st.multiselect(
+                    "Samples",
+                    [v for (_, v) in options],
+                    format_func=lambda idx: next(lbl for (lbl, v) in options if v == idx),
+                    key=sel_key
+                )
+
+                # ====== Clean section bar (quick clear tools) ======
+                st.markdown("**Clean section**")
+                cclean1, cclean2 = st.columns([1, 1])
+                with cclean1:
+                    if st.button("Clear assignment for SELECTED", key=f"clear_sel_{det}"):
+                        if not selected:
+                            st.warning("No sample selected.")
+                        else:
+                            st.session_state.assign_df.loc[selected, ["Condition", "Replicate"]] = ["", ""]
+                            st.success(f"Cleared assignments for {len(selected)} row(s).")
+                with cclean2:
+                    if st.button("Clear assignment for ALL in this detector", key=f"clear_all_{det}"):
+                        locs = sub["index"].to_list()
+                        st.session_state.assign_df.loc[locs, ["Condition", "Replicate"]] = ["", ""]
+                        st.success(f"Cleared assignments for ALL {len(locs)} row(s) in '{det}'.")
+
+                # ====== Select all / clear selection ======
+                csel1, csel2 = st.columns([1, 1])
+                if csel1.button("Select all (filtered rows)", key=f"selall_{det}"):
+                    st.session_state[sel_key] = [v for (_, v) in options]
+                    st.experimental_rerun()
+                if csel2.button("Clear selection", key=f"selclr_{det}"):
+                    st.session_state[sel_key] = []
+                    st.experimental_rerun()
+
+                # ====== Apply Condition / Replicate ======
+                c1, c2, c3, c4 = st.columns([2, 2, 2, 2])
+                with c1:
+                    pick_cond = st.selectbox("Condition", st.session_state.conditions, key=f"cond_{det}")
+                with c2:
+                    pick_rep = st.selectbox("Bio Rep", ["Rep1", "Rep2", "Rep3"], key=f"rep_{det}")
+                with c3:
+                    apply_clicked = st.button("Apply to selected", key=f"apply_{det}")
+                with c4:
+                    apply_all_clicked = st.button("Apply to ALL in this detector", key=f"applyall_{det}")
+
+                if apply_clicked:
+                    if not selected:
+                        st.warning("No sample selected.")
+                    else:
+                        st.session_state.assign_df.loc[selected, ["Condition", "Replicate"]] = [pick_cond, pick_rep]
+                        st.success(f"Applied to {len(selected)} row(s).")
+
+                if apply_all_clicked:
+                    locs = sub["index"].to_list()
+                    st.session_state.assign_df.loc[locs, ["Condition", "Replicate"]] = [pick_cond, pick_rep]
+                    st.success(f"Applied to ALL {len(locs)} row(s) in '{det}'.")
+
+                # ====== Template (copy/paste per detector, size must match) ======
+                t1, t2 = st.columns([1, 1])
+                if t1.button("Copy as template", key=f"copy_{det}"):
+                    templ = st.session_state.assign_df.loc[sub["index"], ["Condition", "Replicate"]].copy().reset_index(drop=True)
+                    st.session_state.detector_template = templ
+                    st.success(f"Template copied from '{det}' ({len(templ)} rows).")
+
+                if t2.button("Use the template", key=f"paste_{det}"):
+                    templ = st.session_state.detector_template
+                    tgt = st.session_state.assign_df.loc[sub["index"], ["Condition", "Replicate"]].copy().reset_index(drop=True)
+                    if templ is None:
+                        st.warning("No template copied yet.")
+                    elif len(templ) != len(tgt):
+                        st.warning(f"Template size mismatch: template={len(templ)} vs target={len(tgt)}")
+                    else:
+                        st.session_state.assign_df.loc[sub["index"], ["Condition", "Replicate"]] = templ.values
+                        st.success(f"Template applied to '{det}'.")
+
+                # ====== Preview (with current assignments) ======
+                st.caption("Updated table (after operations)")
+                sub_preview = work[work["Detector Name"] == det][["index", "Sample Name", "Ct"]].copy()
+                sub_preview["Condition"] = st.session_state.assign_df.loc[sub_preview["index"], "Condition"].values
+                sub_preview["Replicate"] = st.session_state.assign_df.loc[sub_preview["index"], "Replicate"].values
+                sub_preview = sub_preview.drop(columns=["index"])
+                st.dataframe(sub_preview, use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+
+        # ---- Save to session (validation) ----
+        if st.button("Save assignment", type="primary", key="save_assign"):
+            assigned = st.session_state.assign_df.copy()
+            target_idx = st.session_state.df_raw.index[
+                st.session_state.df_raw["Task"].astype(str).str.lower() == "unknown"
+            ]
+            missing_mask = (assigned.loc[target_idx, "Condition"] == "") | (assigned.loc[target_idx, "Replicate"] == "")
+            if missing_mask.any():
+                miss_count = int(missing_mask.sum())
+                st.error(f"{miss_count} samples missing assignment (Condition or Replicate).")
+            else:
+                if "Condition" not in st.session_state.df_raw.columns:
+                    st.session_state.df_raw["Condition"] = ""
+                if "Replicate" not in st.session_state.df_raw.columns:
+                    st.session_state.df_raw["Replicate"] = ""
+
+                st.session_state.df_raw.loc[:, "Condition"] = assigned["Condition"].fillna(st.session_state.df_raw["Condition"])
+                st.session_state.df_raw.loc[:, "Replicate"] = assigned["Replicate"].fillna(st.session_state.df_raw["Replicate"])
+
+                st.session_state.df_smp = st.session_state.df_raw[
+                    st.session_state.df_raw["Task"].astype(str).str.lower() == "unknown"
+                ].copy()
+
+                st.success("Assignments saved.")
 
 # 5) Quantify（helpers を使用：Undetermined/欠損は NaN 扱い）
 with t5:
