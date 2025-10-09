@@ -535,48 +535,53 @@ with t6:
         today = pd.Timestamp.now().strftime("%Y-%m-%d")
         base_name = f"{today}qPCR_Results"
 
-        # ---- helper: draw panels (ALWAYS show all conditions; 0 if missing) ----
+                # ---- helper: draw panels (ALWAYS show all conditions; 0 if missing) ----
         def draw_relq_panel(ax, ddf, conds):
             """
             Draw bar (Mean±SEM) by Condition.
             Even when a condition has no data, draw a bar at 0 so it never disappears.
             Technical replicate dots are plotted only for conditions that have data.
             """
-            # Use only needed columns
-            vals = ddf[["Condition", "Replicate", "Relative Quantity"]].copy()
-
-            # Template for all conditions → start at zeros
+            # すべての条件を 0 初期化（データが無くても棒を描く）
             cond_stats = pd.DataFrame({"Condition": conds, "Mean": 0.0, "SEM": 0.0})
 
-            rep_means = pd.DataFrame(columns=["Condition", "Replicate", "Rep_Mean"])
+            vals = ddf[["Condition", "Replicate", "Relative Quantity"]].copy()
             usable = vals.dropna(subset=["Relative Quantity"])
+
+            # データがあれば Replicate 平均 → Condition の Mean/SEM
             if not usable.empty:
-                # replicate-level means (NaN automatically excluded)
                 rep_means = (
                     usable.groupby(["Condition", "Replicate"], observed=False)["Relative Quantity"]
                           .mean()
                           .reset_index(name="Rep_Mean")
                 )
-                # condition-level Mean/SEM, then overwrite zeros where data exist
                 _cs = (
                     rep_means.groupby("Condition", observed=False)["Rep_Mean"]
                              .agg(Mean="mean", SEM=lambda s: s.std(ddof=1) / np.sqrt(s.count()))
                              .reset_index()
                 )
-                cond_stats = cond_stats.merge(_cs, on="Condition", how="left")
-                # prefer computed Mean where available; keep 0 otherwise
-                cond_stats["Mean"] = cond_stats["Mean_y"].fillna(cond_stats["Mean_x"])
-                cond_stats["SEM"]  = cond_stats["SEM"].fillna(0.0)
-                cond_stats = cond_stats[["Condition", "Mean", "SEM"]]
+                if not _cs.empty:
+                    merged = cond_stats.merge(_cs, on="Condition", how="left", suffixes=("_base", ""))
+                    mean_new = merged["Mean"].where(merged["Mean"].notna(), merged["Mean_base"])
+                    sem_new  = merged["SEM"].where(merged["SEM"].notna(), merged["SEM_base"])
+                    cond_stats = pd.DataFrame({
+                        "Condition": merged["Condition"],
+                        "Mean": mean_new.fillna(0.0),
+                        "SEM":  sem_new.fillna(0.0),
+                    })
+                else:
+                    rep_means = pd.DataFrame(columns=["Condition", "Replicate", "Rep_Mean"])
+            else:
+                rep_means = pd.DataFrame(columns=["Condition", "Replicate", "Rep_Mean"])
 
-            # bars (0 also shown)
+            # 棒（0 も描画）
             ax.bar(
                 cond_stats["Condition"], cond_stats["Mean"],
                 yerr=cond_stats["SEM"], capsize=2, alpha=0.65, linewidth=0.4,
                 error_kw={"elinewidth": 0.25, "capthick": 0.25}
             )
 
-            # dot for each replicate mean (only where data exist)
+            # 黒ドット（データがある条件のみ）
             if not rep_means.empty:
                 cond_to_x = {c: i for i, c in enumerate(cond_stats["Condition"])}
                 rep_offset = {"Rep1": -0.12, "Rep2": 0.0, "Rep3": 0.12}
