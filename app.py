@@ -62,6 +62,7 @@ def clean_dataframe_for_analysis(df: pd.DataFrame) -> pd.DataFrame:
     _rn("Task", lambda c:c.lower()=="task")
     _rn("Quantity", lambda c:"quantity" in c.lower())
 
+    # Undetermined → NaN
     df["Ct"] = pd.to_numeric(df["Ct"].replace({"Undetermined":np.nan,"undetermined":np.nan}), errors="coerce")
     df["Quantity"] = pd.to_numeric(df.get("Quantity", np.nan), errors="coerce")
     with warnings.catch_warnings():
@@ -71,8 +72,10 @@ def clean_dataframe_for_analysis(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def compute_standard_curve(df_std: pd.DataFrame):
-    d = df_std.dropna(subset=["Ct","Quantity"]).copy()
-    if len(d) < 2: return None
+    d = df_std.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct","Quantity"]).copy()
+    d = d[d["Quantity"] > 0]
+    if len(d) < 2:
+        return None
     X = np.log10(d["Quantity"].values).reshape(-1,1)
     y = d["Ct"].values
     model = LinearRegression().fit(X,y)
@@ -80,7 +83,8 @@ def compute_standard_curve(df_std: pd.DataFrame):
     return {"slope": float(model.coef_[0]), "intercept": float(model.intercept_), "r2": float(r2), "model": model}
 
 def ct_to_quantity(ct, slope, intercept):
-    if slope == 0 or np.isnan(slope): return np.nan
+    if pd.isna(ct) or slope == 0 or np.isnan(slope):
+        return np.nan
     return float(10 ** ((ct - intercept) / slope))
 
 # ---------- State ----------
@@ -100,11 +104,11 @@ t1, t2, t3, t4, t5, t6 = st.tabs(["1) Upload", "2) Clean Standards", "3) Curves"
 # 1) Upload —— 複数ファイル対応版（安定化）
 with t1:
     ups = st.file_uploader(
-        "📄 qPCR結果ファイルをアップロード（複数可 / TXT・TSV・CSV）",
+        "📄 Upload qPCR result files (multiple allowed / TXT・TSV・CSV）",
         type=["txt", "tsv", "csv"],
         accept_multiple_files=True,
         key="uploader_multi",
-        help="同じランの分割書き出しや別ファイルをまとめて読み込めます。"
+        help="You can combine multiple exports from the same run."
     )
 
     col_l, col_r = st.columns([1,1])
@@ -117,14 +121,12 @@ with t1:
 
     if load_clicked:
         if not ups:
-            st.warning("ファイルが選ばれていません。")
+            st.warning("No files selected.")
         else:
-            df_list = []
-            errs = []
+            df_list, errs = [], []
             for up in ups:
                 try:
-                    # バイト列を安全に取得（readよりgetvalueが堅牢）
-                    content_bytes = up.getvalue()
+                    content_bytes = up.getvalue()  # robust vs .read()
                     df_tmp = read_qpcr_textfile(content_bytes)
                     df_tmp = clean_dataframe_for_analysis(df_tmp)
                     df_tmp["SourceFile"] = up.name
@@ -133,7 +135,7 @@ with t1:
                     errs.append(f"{up.name}: {e}")
 
             if errs:
-                st.error("一部のファイルで読み込みに失敗しました。詳細↓")
+                st.error("Some files failed to load. Details below:")
                 st.code("\n".join(errs))
 
             if df_list:
@@ -142,21 +144,21 @@ with t1:
                 st.session_state.df_raw = df
                 st.success(f"Loaded {len(df_list)} file(s). Total rows = {len(df):,}")
             else:
-                st.warning("読み込めるファイルがありませんでした。")
+                st.warning("No readable files were found.")
 
     # プレビュー & 必須列チェック
     if st.session_state.get("df_raw") is not None:
-        st.caption("先頭プレビュー（最大30行）")
+        st.caption("Preview of the first rows (max 30)")
         st.dataframe(st.session_state.df_raw.head(30), use_container_width=True)
 
         need = {"Task", "Ct", "Detector Name"}
         miss = [c for c in need if c not in st.session_state.df_raw.columns]
         if miss:
-            st.error(f"必須列が不足: {miss}")
+            st.error(f"Missing required columns: {miss}")
         else:
             cols = [c for c in ["Detector Name", "Task", "SourceFile"] if c in st.session_state.df_raw.columns]
             if cols:
-                with st.expander("概要（Detector/Task/SourceFile）", expanded=False):
+                with st.expander("Summary（Detector/Task/SourceFile）", expanded=False):
                     st.write(
                         st.session_state.df_raw[cols]
                         .value_counts()
@@ -222,10 +224,10 @@ with t4:
         df_smp = st.session_state.df_raw.copy()
         df_smp = df_smp[df_smp["Task"].astype(str).str.lower()=="unknown"].copy()
         if df_smp.empty:
-            st.warning("NoUnknown")
+            st.warning("No 'Unknown' samples were found in the uploaded data.")
         else:
             st.session_state.conditions = st.text_area(
-                "Conditions (1行に1つ)", value="\n".join(st.session_state.conditions), height=100
+                "Conditions (one per line)", value="\n".join(st.session_state.conditions), height=100
             ).splitlines()
             st.session_state.conditions = [c.strip() for c in st.session_state.conditions if c.strip()]
             df_smp = df_smp.sort_values(["Detector Name","Well"], na_position="last").reset_index(drop=True)
@@ -248,43 +250,33 @@ with t4:
                     st.session_state.df_smp = df_smp
                     st.success("Assignments saved.")
 
-# 5) Quantify（Undetectedは Quantity=0 として扱い、SEMで描画）
+# 5) Quantify（helpers を使用：Undetermined/欠損は NaN 扱い）
 with t5:
     if st.session_state.df_smp is None or st.session_state.df_std_clean is None:
         st.info("Please Complete 2) & 4)")
     else:
-        # Ct→Quantity（Ct欠損/Undetectedは0扱い）
-        def _ct_to_qty(ct, slope, intercept):
-            if pd.isna(ct):
-                return 0.0
-            if slope == 0 or np.isnan(slope):
-                return np.nan
-            return float(10 ** ((ct - intercept) / slope))
-
         df_smp = st.session_state.df_smp.copy()
         df_smp["Quantity"] = np.nan
 
+        # 各 Detector の標準曲線を helper で作成し、ct_to_quantity で Quantity 化
         for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
             dstd = st.session_state.df_std_clean[
                 (st.session_state.df_std_clean["Detector Name"] == det) &
                 (st.session_state.df_std_clean["Task"].astype(str).str.lower() == "standard")
             ].copy()
-            dstd = dstd.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct","Quantity"])
-            dstd = dstd[dstd["Quantity"] > 0]
-            if len(dstd) < 2:
-                st.warning(f"'{det}': 標準点が2点未満または Quantity<=0。計算スキップ。")
+
+            sc = compute_standard_curve(dstd)
+            if sc is None:
+                st.warning(f"Detector '{det}': Not enough standard points or Quantity <= 0. Skipped.")
                 continue
 
-            X = np.log10(dstd["Quantity"].to_numpy()).reshape(-1, 1)
-            y = dstd["Ct"].to_numpy()
-            model = LinearRegression().fit(X, y)
-            slope = float(model.coef_[0]); intercept = float(model.intercept_)
-
-            rows_all = (df_smp["Detector Name"] == det)
-            df_smp.loc[rows_all, "Quantity"] = df_smp.loc[rows_all, "Ct"].apply(
-                lambda c: _ct_to_qty(c, slope, intercept)
+            slope, intercept = sc["slope"], sc["intercept"]
+            mask = (df_smp["Detector Name"] == det)
+            df_smp.loc[mask, "Quantity"] = df_smp.loc[mask, "Ct"].apply(
+                lambda c: ct_to_quantity(c, slope, intercept)
             )
-            df_smp.loc[rows_all & (df_smp["Quantity"] < 0), "Quantity"] = np.nan
+            # 数値誤差などの負値防止
+            df_smp.loc[mask & (df_smp["Quantity"] < 0), "Quantity"] = np.nan
 
         detectors_for_ctrl = sorted(df_smp["Detector Name"].dropna().unique().tolist())
         if not detectors_for_ctrl:
@@ -293,6 +285,7 @@ with t5:
             ctrl_det = st.selectbox("Control detector", detectors_for_ctrl, key="ctrl_det_select")
 
             if st.button("Run Relative Quantification"):
+                # Control Quantity（0 や NaN は無効→ NaN）
                 ctrl_df = (
                     df_smp[df_smp["Detector Name"] == ctrl_det][["Condition", "Replicate", "Quantity"]]
                     .rename(columns={"Quantity": "Ctrl_Quantity"})
@@ -300,6 +293,7 @@ with t5:
                 )
                 ctrl_df.loc[(ctrl_df["Ctrl_Quantity"] <= 0) | (ctrl_df["Ctrl_Quantity"].isna()), "Ctrl_Quantity"] = np.nan
 
+                # Fallback: Condition 平均
                 ctrl_cond_mean = (
                     ctrl_df.groupby("Condition", as_index=False)["Ctrl_Quantity"]
                     .mean()
@@ -317,6 +311,7 @@ with t5:
                         .reset_index()
                         .rename(columns={"index": "orig_index"})
                     )
+
                     merged = ddet.merge(ctrl_df, on=["Condition","Replicate"], how="left")
                     if merged["Ctrl_Quantity"].isna().any():
                         merged = merged.merge(ctrl_cond_mean, on="Condition", how="left")
@@ -331,17 +326,22 @@ with t5:
                         np.nan,
                         merged["Quantity"] / merged["Used_Ctrl"]
                     )
+
+                    # ここで technical replicate 内に 0 があった場合の平均から除外は、#6 の描画集計側で対応（NaN 化したものは平均・SEMから自然に除外）
                     df_temp.loc[merged["orig_index"], "Relative Quantity"] = merged["Relative Quantity"].values
 
+                # Replicate 単位（Condition×Replicate）で Mean/SEM
                 stats = (
                     df_temp.groupby(["Detector Name", "Condition", "Replicate"], observed=False)["Relative Quantity"]
                     .agg(["mean", "sem"]).reset_index()
                     .rename(columns={"mean": "RelQ_Mean", "sem": "RelQ_SEM"})
                 )
+
                 st.session_state.df_smp_updated = df_temp.merge(
                     stats, on=["Detector Name", "Condition", "Replicate"], how="left"
                 )
                 st.success("Relative quantification done.")
+
         if st.session_state.get("df_smp_updated") is not None:
             st.dataframe(st.session_state.df_smp_updated.head(30), use_container_width=True)
 
