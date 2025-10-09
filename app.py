@@ -529,49 +529,63 @@ with t6:
         st.info("Please proceed with 5)")
     else:
         import io, zipfile
-        # ---- 日付入りベース名 ----
+        from matplotlib.backends.backend_pdf import PdfPages
+
+        # ---- date-stamped base name ----
         today = pd.Timestamp.now().strftime("%Y-%m-%d")
         base_name = f"{today}qPCR_Results"
 
-        # ---- 描画ヘルパー（相対量：バー±SEM(0.25pt)＋Rep黒ドット）----
+        # ---- helper: draw panels (ALWAYS show all conditions; 0 if missing) ----
         def draw_relq_panel(ax, ddf, conds):
-            vals = ddf[["Condition","Replicate","Relative Quantity"]].dropna()
-            if vals.empty:
-                ax.text(0.5, 0.5, "No data", ha="center", va="center", fontsize=8)
-                ax.set_axis_off()
-                return False
+            """
+            Draw bar (Mean±SEM) by Condition.
+            Even when a condition has no data, draw a bar at 0 so it never disappears.
+            Technical replicate dots are plotted only for conditions that have data.
+            """
+            # Use only needed columns
+            vals = ddf[["Condition", "Replicate", "Relative Quantity"]].copy()
 
-            rep_means = (
-                vals.groupby(["Condition","Replicate"], observed=False)["Relative Quantity"]
-                    .mean()
-                    .reset_index(name="Rep_Mean")
-            )
-            cond_stats = (
-                rep_means.groupby("Condition", observed=False)["Rep_Mean"]
-                    .agg(Mean="mean", SEM=lambda s: s.std(ddof=1) / np.sqrt(s.count()))
-                    .reindex(conds).reset_index()
-            )
-            if cond_stats["Mean"].notna().sum() == 0:
-                ax.text(0.5, 0.5, "NaN", ha="center", va="center", fontsize=8)
-                ax.set_axis_off()
-                return False
+            # Template for all conditions → start at zeros
+            cond_stats = pd.DataFrame({"Condition": conds, "Mean": 0.0, "SEM": 0.0})
 
-            yerr = cond_stats["SEM"].to_numpy()
+            rep_means = pd.DataFrame(columns=["Condition", "Replicate", "Rep_Mean"])
+            usable = vals.dropna(subset=["Relative Quantity"])
+            if not usable.empty:
+                # replicate-level means (NaN automatically excluded)
+                rep_means = (
+                    usable.groupby(["Condition", "Replicate"], observed=False)["Relative Quantity"]
+                          .mean()
+                          .reset_index(name="Rep_Mean")
+                )
+                # condition-level Mean/SEM, then overwrite zeros where data exist
+                _cs = (
+                    rep_means.groupby("Condition", observed=False)["Rep_Mean"]
+                             .agg(Mean="mean", SEM=lambda s: s.std(ddof=1) / np.sqrt(s.count()))
+                             .reset_index()
+                )
+                cond_stats = cond_stats.merge(_cs, on="Condition", how="left")
+                # prefer computed Mean where available; keep 0 otherwise
+                cond_stats["Mean"] = cond_stats["Mean_y"].fillna(cond_stats["Mean_x"])
+                cond_stats["SEM"]  = cond_stats["SEM"].fillna(0.0)
+                cond_stats = cond_stats[["Condition", "Mean", "SEM"]]
+
+            # bars (0 also shown)
             ax.bar(
                 cond_stats["Condition"], cond_stats["Mean"],
-                yerr=yerr, capsize=2, alpha=0.65, linewidth=0.4,
+                yerr=cond_stats["SEM"], capsize=2, alpha=0.65, linewidth=0.4,
                 error_kw={"elinewidth": 0.25, "capthick": 0.25}
             )
 
-            cond_to_x = {c:i for i, c in enumerate(cond_stats["Condition"])}
-            rep_offset = {"Rep1": -0.12, "Rep2": 0.0, "Rep3": 0.12}
-            for _, row in rep_means.iterrows():
-                c = row["Condition"]
-                x = cond_to_x.get(c, None)
-                if x is None:
-                    continue
-                off = rep_offset.get(str(row["Replicate"]), 0.0)
-                ax.scatter(x + off, row["Rep_Mean"], s=18, zorder=3, color="black")
+            # dot for each replicate mean (only where data exist)
+            if not rep_means.empty:
+                cond_to_x = {c: i for i, c in enumerate(cond_stats["Condition"])}
+                rep_offset = {"Rep1": -0.12, "Rep2": 0.0, "Rep3": 0.12}
+                for _, row in rep_means.iterrows():
+                    x = cond_to_x.get(row["Condition"])
+                    if x is None:
+                        continue
+                    ax.scatter(x + rep_offset.get(str(row["Replicate"]), 0.0),
+                               row["Rep_Mean"], s=18, zorder=3, color="black")
 
             ax.set_ylabel("Relative Quantity", fontsize=8)
             ax.set_ylim(bottom=0)
@@ -581,76 +595,89 @@ with t6:
                 spine.set_linewidth(0.4)
             return True
 
-        # ---- レイアウト設定（2in x 2in のタイル）----
-        NCOLS, NROWS = 4, 3             # 1ページ12面
-        PANEL_W, PANEL_H = 2.0, 2.0     # 各パネル 2in四方
-        FIG_W, FIG_H = NCOLS*PANEL_W, NROWS*PANEL_H
+        # ---- layout (2in x 2in tiles) ----
+        NCOLS, NROWS = 4, 3               # 12 panels per page
+        PANEL_W, PANEL_H = 2.0, 2.0       # each panel
+        FIG_W, FIG_H = NCOLS * PANEL_W, NROWS * PANEL_H
 
-        dets = st.session_state.df_smp_updated["Detector Name"].dropna().unique().tolist()
-        conds = st.session_state.conditions
+        dets  = st.session_state.df_smp_updated["Detector Name"].dropna().unique().tolist()
+        conds = st.session_state.conditions  # keep the user-defined order
 
-        # A) 相対量グリッド PDF + UIプレビュー
-        relq_pdf_buf = io.BytesIO()
+        # A) Relative-quantity grid PDF + UI previews (PNG)
+        relq_pdf_buf   = io.BytesIO()
         relq_page_pngs = []
         with PdfPages(relq_pdf_buf) as pdf:
             panel_i = 0
             fig = None; axs = None
+
             for det in dets:
-                if panel_i % (NCOLS*NROWS) == 0:
+                if panel_i % (NCOLS * NROWS) == 0:
+                    # flush previous page
                     if fig is not None:
                         fig.tight_layout(pad=0.8); pdf.savefig(fig)
-                        buf_png = io.BytesIO(); fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
-                        relq_page_pngs.append(buf_png.getvalue()); plt.close(fig)
+                        buf_png = io.BytesIO()
+                        fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+                        relq_page_pngs.append(buf_png.getvalue())
+                        plt.close(fig)
                     fig, ax_grid = plt.subplots(NROWS, NCOLS, figsize=(FIG_W, FIG_H))
                     axs = ax_grid.flatten()
 
-                ax = axs[panel_i % (NCOLS*NROWS)]
-                ddf = st.session_state.df_smp_updated[st.session_state.df_smp_updated["Detector Name"]==det].copy()
+                ax  = axs[panel_i % (NCOLS * NROWS)]
+                ddf = st.session_state.df_smp_updated[
+                    st.session_state.df_smp_updated["Detector Name"] == det
+                ].copy()
+
                 draw_relq_panel(ax, ddf, conds)
                 ax.set_title(det, fontsize=9)
                 panel_i += 1
 
             if fig is not None:
-                used = panel_i % (NCOLS*NROWS) or (NCOLS*NROWS)
-                if used < (NCOLS*NROWS):
-                    for k in range(used, NCOLS*NROWS):
+                used = panel_i % (NCOLS * NROWS) or (NCOLS * NROWS)
+                if used < (NCOLS * NROWS):
+                    for k in range(used, NCOLS * NROWS):
                         axs[k].axis("off")
                 fig.tight_layout(pad=0.8); pdf.savefig(fig)
-                buf_png = io.BytesIO(); fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
-                relq_page_pngs.append(buf_png.getvalue()); plt.close(fig)
+                buf_png = io.BytesIO()
+                fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+                relq_page_pngs.append(buf_png.getvalue())
+                plt.close(fig)
 
-        # B) Standardカーブ PDF + UIプレビュー
-        std_pdf_buf = io.BytesIO()
+        # B) Standard-curve PDF + previews (unchanged)
+        std_pdf_buf   = io.BytesIO()
         std_page_pngs = []
         with PdfPages(std_pdf_buf) as pdf:
             if st.session_state.df_std_clean is not None and not st.session_state.df_std_clean.empty:
                 panel_i = 0
                 fig = None; axs = None
                 for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
-                    ddf = st.session_state.df_std_clean[st.session_state.df_std_clean["Detector Name"]==det].copy()
-                    dwork = ddf.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct","Quantity"])
+                    ddf   = st.session_state.df_std_clean[
+                        st.session_state.df_std_clean["Detector Name"] == det
+                    ].copy()
+                    dwork = ddf.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct", "Quantity"])
                     dwork = dwork[dwork["Quantity"] > 0]
                     if len(dwork) < 2:
                         continue
 
-                    X = np.log10(dwork["Quantity"].to_numpy()).reshape(-1,1)
+                    X = np.log10(dwork["Quantity"].to_numpy()).reshape(-1, 1)
                     y = dwork["Ct"].to_numpy()
-                    model = LinearRegression().fit(X,y)
+                    model = LinearRegression().fit(X, y)
                     slope = float(model.coef_[0]); intercept = float(model.intercept_)
-                    r2 = r2_score(y, model.predict(X))
+                    r2    = r2_score(y, model.predict(X))
 
-                    if panel_i % (NCOLS*NROWS) == 0:
+                    if panel_i % (NCOLS * NROWS) == 0:
                         if fig is not None:
                             fig.tight_layout(pad=0.8); pdf.savefig(fig)
-                            buf_png = io.BytesIO(); fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
-                            std_page_pngs.append(buf_png.getvalue()); plt.close(fig)
+                            buf_png = io.BytesIO()
+                            fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+                            std_page_pngs.append(buf_png.getvalue())
+                            plt.close(fig)
                         fig, ax_grid = plt.subplots(NROWS, NCOLS, figsize=(FIG_W, FIG_H))
                         axs = ax_grid.flatten()
 
-                    ax = axs[panel_i % (NCOLS*NROWS)]
-                    x = np.log10(dwork["Quantity"]); yv = dwork["Ct"]
+                    ax = axs[panel_i % (NCOLS * NROWS)]
+                    x  = np.log10(dwork["Quantity"]); yv = dwork["Ct"]
                     ax.scatter(x, yv, s=10, color="black")
-                    xx = np.linspace(x.min(), x.max(), 100).reshape(-1,1)
+                    xx = np.linspace(x.min(), x.max(), 100).reshape(-1, 1)
                     ax.plot(xx, model.predict(xx), "--", linewidth=0.8, color="black")
                     ax.set_title(f"{det}\nslope={slope:.3f}, R²={r2:.3f}", fontsize=8)
                     ax.set_xlabel("log10(Quantity)", fontsize=7)
@@ -661,19 +688,21 @@ with t6:
                     panel_i += 1
 
                 if fig is not None:
-                    used = panel_i % (NCOLS*NROWS) or (NCOLS*NROWS)
-                    if used < (NCOLS*NROWS):
-                        for k in range(used, NCOLS*NROWS):
+                    used = panel_i % (NCOLS * NROWS) or (NCOLS * NROWS)
+                    if used < (NCOLS * NROWS):
+                        for k in range(used, NCOLS * NROWS):
                             axs[k].axis("off")
                     fig.tight_layout(pad=0.8); pdf.savefig(fig)
-                    buf_png = io.BytesIO(); fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
-                    std_page_pngs.append(buf_png.getvalue()); plt.close(fig)
+                    buf_png = io.BytesIO()
+                    fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
+                    std_page_pngs.append(buf_png.getvalue())
+                    plt.close(fig)
 
-        # C) CSV
+        # C) CSV export (table)
         buf_csv = io.StringIO()
         st.session_state.df_smp_updated.to_csv(buf_csv, index=False)
 
-        # D) ZIP（相対量グリッドPDF + StandardカーブPDF + CSV）
+        # D) ZIP (grid PDF + std PDF + CSV)
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(f"{base_name}_grid2x2.pdf", relq_pdf_buf.getvalue())
@@ -687,7 +716,7 @@ with t6:
             mime="application/zip"
         )
 
-        # E) UI プレビュー（PDFと同じページをPNGで表示）
+        # E) On-screen previews (same pages as PDFs)
         st.subheader("📄 Relative expression (grid) preview")
         if relq_page_pngs:
             for i, png in enumerate(relq_page_pngs, start=1):
