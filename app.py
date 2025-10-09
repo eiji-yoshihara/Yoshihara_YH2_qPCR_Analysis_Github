@@ -310,7 +310,24 @@ with t5:
                         df_temp.loc[mask, ["Condition", "Replicate", "Quantity"]]
                         .reset_index()
                         .rename(columns={"index": "orig_index"})
+                        .sort_values("orig_index").reset_index(drop=True)
                     )
+# 同じ Condition & Replicate を持つ Control の行を抽出
+                    cond_rep = ddet[["Condition", "Replicate"]].drop_duplicates()
+                    ctrl_sub = ctrl_df.merge(cond_rep, on=["Condition", "Replicate"], how="inner")
+                    ctrl_sub = ctrl_sub.sort_values("orig_index").reset_index(drop=True)
+ # 行数を比較
+                    if len(ctrl_sub) == len(ddet):
+                # ✅ 対応数が一致 → 横結合で安全に結合
+                        merged = pd.concat([ddet, ctrl_sub["Ctrl_Quantity"]], axis=1)
+                        merged["Used_Ctrl"] = merged["Ctrl_Quantity"]
+                        merged["Relative Quantity"] = merged["Quantity"] / merged["Used_Ctrl"]
+                    else:
+                # ⚠️ 行数が異なる（technical replicates数不一致）
+                        warnings.warn(
+                        f"⚠️ Detector '{det}': Control and target replicate counts differ "
+                        f"({len(ctrl_sub)} vs {len(ddet)}). Using Condition-level mean instead."
+                        )
 
                     merged = ddet.merge(ctrl_df, on=["Condition","Replicate"], how="left")
                     if merged["Ctrl_Quantity"].isna().any():
