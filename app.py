@@ -417,7 +417,7 @@ with t5:
         df_smp = st.session_state.df_smp.copy()
         df_smp["Quantity"] = np.nan
 
-        # 各 Detector の標準曲線を helper で作成し、ct_to_quantity で Quantity 化
+        # --- 1) Ct -> Quantity for each detector via standard curve ---
         for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
             dstd = st.session_state.df_std_clean[
                 (st.session_state.df_std_clean["Detector Name"] == det) &
@@ -434,7 +434,7 @@ with t5:
             df_smp.loc[mask, "Quantity"] = df_smp.loc[mask, "Ct"].apply(
                 lambda c: ct_to_quantity(c, slope, intercept)
             )
-            # 数値誤差などの負値防止
+            # guard against negative due to numeric glitches
             df_smp.loc[mask & (df_smp["Quantity"] < 0), "Quantity"] = np.nan
 
         detectors_for_ctrl = sorted(df_smp["Detector Name"].dropna().unique().tolist())
@@ -444,15 +444,17 @@ with t5:
             ctrl_det = st.selectbox("Control detector", detectors_for_ctrl, key="ctrl_det_select")
 
             if st.button("Run Relative Quantification"):
-                # Control Quantity（0 や NaN は無効→ NaN）
+                # --- 2) Build control table (attach orig_index for order alignment) ---
                 ctrl_df = (
                     df_smp[df_smp["Detector Name"] == ctrl_det][["Condition", "Replicate", "Quantity"]]
                     .rename(columns={"Quantity": "Ctrl_Quantity"})
                     .copy()
                 )
+                # 0 or missing control quantities are invalid denominators
                 ctrl_df.loc[(ctrl_df["Ctrl_Quantity"] <= 0) | (ctrl_df["Ctrl_Quantity"].isna()), "Ctrl_Quantity"] = np.nan
+                ctrl_df = ctrl_df.sort_index().reset_index().rename(columns={"index": "orig_index"})
 
-                # Fallback: Condition 平均
+                # Fallback: condition-level mean of control
                 ctrl_cond_mean = (
                     ctrl_df.groupby("Condition", as_index=False)["Ctrl_Quantity"]
                     .mean()
@@ -463,38 +465,38 @@ with t5:
                 if "Relative Quantity" not in df_temp.columns:
                     df_temp["Relative Quantity"] = np.nan
 
+                # --- 3) Per-detector relative quantification ---
                 for det in df_temp["Detector Name"].dropna().unique():
-                    mask = df_temp["Detector Name"] == det
+                    m = (df_temp["Detector Name"] == det)
                     ddet = (
-                        df_temp.loc[mask, ["Condition", "Replicate", "Quantity"]]
+                        df_temp.loc[m, ["Condition", "Replicate", "Quantity"]]
                         .reset_index()
                         .rename(columns={"index": "orig_index"})
                         .sort_values("orig_index").reset_index(drop=True)
                     )
-# 同じ Condition & Replicate を持つ Control の行を抽出
+
+                    # pair with control rows that share Condition + Replicate
                     cond_rep = ddet[["Condition", "Replicate"]].drop_duplicates()
                     ctrl_sub = ctrl_df.merge(cond_rep, on=["Condition", "Replicate"], how="inner")
-                    ctrl_sub = ctrl_sub.sort_values("orig_index").reset_index(drop=True)
- # 行数を比較
-                    if len(ctrl_sub) == len(ddet):
-                # ✅ 対応数が一致 → 横結合で安全に結合
-                        merged = pd.concat([ddet, ctrl_sub["Ctrl_Quantity"]], axis=1)
-                        merged["Used_Ctrl"] = merged["Ctrl_Quantity"]
-                        merged["Relative Quantity"] = merged["Quantity"] / merged["Used_Ctrl"]
-                    else:
-                # ⚠️ 行数が異なる（technical replicates数不一致）
-                        warnings.warn(
-                        f"⚠️ Detector '{det}': Control and target replicate counts differ "
-                        f"({len(ctrl_sub)} vs {len(ddet)}). Using Condition-level mean instead."
-                        )
 
-                    merged = ddet.merge(ctrl_df, on=["Condition","Replicate"], how="left")
-                    if merged["Ctrl_Quantity"].isna().any():
+                    # if we can align one-to-one, keep that order using control's orig_index
+                    if len(ctrl_sub) == len(ddet):
+                        ctrl_sub = ctrl_sub.sort_values("orig_index").reset_index(drop=True)
+                        merged = ddet.copy()
+                        merged["Ctrl_Quantity"] = ctrl_sub["Ctrl_Quantity"].values
+                        merged["Used_Ctrl"] = merged["Ctrl_Quantity"]
+                    else:
+                        warnings.warn(
+                            f"Detector '{det}': Control and target replicate counts differ "
+                            f"({len(ctrl_sub)} vs {len(ddet)}). Using condition-level control mean."
+                        )
+                        # fallback: merge control (may bring NaN) then fill by condition mean
+                        merged = ddet.merge(ctrl_df[["Condition", "Replicate", "Ctrl_Quantity"]],
+                                            on=["Condition", "Replicate"], how="left")
                         merged = merged.merge(ctrl_cond_mean, on="Condition", how="left")
                         merged["Used_Ctrl"] = merged["Ctrl_Quantity"].fillna(merged["Ctrl_Cond_Mean"])
-                    else:
-                        merged["Used_Ctrl"] = merged["Ctrl_Quantity"]
 
+                    # invalid denominator or numerator -> NaN
                     invalid_den = merged["Used_Ctrl"].isna() | (merged["Used_Ctrl"] <= 0)
                     invalid_num = merged["Quantity"].isna() | (merged["Quantity"] < 0)
                     merged["Relative Quantity"] = np.where(
@@ -503,10 +505,10 @@ with t5:
                         merged["Quantity"] / merged["Used_Ctrl"]
                     )
 
-                    # ここで technical replicate 内に 0 があった場合の平均から除外は、#6 の描画集計側で対応（NaN 化したものは平均・SEMから自然に除外）
+                    # write back
                     df_temp.loc[merged["orig_index"], "Relative Quantity"] = merged["Relative Quantity"].values
 
-                # Replicate 単位（Condition×Replicate）で Mean/SEM
+                # --- 4) Mean/SEM per (Detector, Condition, Replicate) ---
                 stats = (
                     df_temp.groupby(["Detector Name", "Condition", "Replicate"], observed=False)["Relative Quantity"]
                     .agg(["mean", "sem"]).reset_index()
