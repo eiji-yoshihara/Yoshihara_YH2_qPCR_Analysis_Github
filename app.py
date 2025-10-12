@@ -262,26 +262,7 @@ with t4:
                 sub = work[work["Detector Name"] == det].copy().reset_index(drop=True)  # has 'index' (df_raw row id)
 
                 # ====== Filter (Sample/Well/Ct) ======
-                f1, f2, f3 = st.columns([2, 1, 1])
-                with f1:
-                    q = st.text_input("Filter (partial match for Sample/Well/Ct)", key=f"q_{det}").strip()
-                with f2:
-                    hide_nan = st.checkbox("Hide Ct NaN", value=False, key=f"nan_{det}")
-                with f3:
-                    st.caption(f"Rows in this detector: {len(sub)}")
-
-                filt = np.ones(len(sub), dtype=bool)
-                if q:
-                    qlow = q.lower()
-                    filt &= (
-                        sub["Sample Name"].astype(str).str.lower().str.contains(qlow) |
-                        sub.get("Well", pd.Series([""] * len(sub))).astype(str).str.lower().str.contains(qlow) |
-                        sub.get("Ct", pd.Series([""] * len(sub))).astype(str).str.lower().str.contains(qlow)
-                    )
-                if hide_nan and "Ct" in sub.columns:
-                    filt &= sub["Ct"].notna()
-
-                view = sub.loc[filt].copy()
+                view = sub.copy()
 
                 # ====== Multi-select target rows ======
                 st.caption("Select samples to apply")
@@ -324,12 +305,8 @@ with t4:
                         st.session_state.assign_df.loc[locs, ["Condition", "Replicate"]] = ["", ""]
                         st.success(f"Cleared assignments for ALL {len(locs)} row(s) in '{det}'.")
 
-                # ====== Select all / clear selection ======
-                csel1, csel2 = st.columns([1, 1])
-                if csel1.button("Select all (filtered rows)", key=f"selall_{det}"):
-                    st.session_state[sel_key] = [v for (_, v) in options]
-                    st.experimental_rerun()
-                if csel2.button("Clear selection", key=f"selclr_{det}"):
+                # ====== Clear selection only ======
+                if st.button("Clear selection", key=f"selclr_{det}"):
                     st.session_state[sel_key] = []
                     st.experimental_rerun()
 
@@ -535,12 +512,13 @@ with t6:
         today = pd.Timestamp.now().strftime("%Y-%m-%d")
         base_name = f"{today}qPCR_Results"
 
-                # ---- helper: draw panels (ALWAYS show all conditions; 0 if missing) ----
+      # ---- helper: draw panels (ALWAYS show all conditions; 0 if missing) ----
         def draw_relq_panel(ax, ddf, conds):
             """
-            Draw bar (Mean±SEM) by Condition.
-            Even when a condition has no data, draw a bar at 0 so it never disappears.
-            Technical replicate dots are plotted only for conditions that have data.
+            Bar = Mean of 'Relative Quantity' per Condition,
+            Error bar = SEM across biological replicates (Replicate) within each Condition.
+            Even when a condition has no data, draw a bar at 0 (so it never disappears).
+            Replicate dots are plotted only for conditions that have data.
             """
             # すべての条件を 0 初期化（データが無くても棒を描く）
             cond_stats = pd.DataFrame({"Condition": conds, "Mean": 0.0, "SEM": 0.0})
@@ -548,18 +526,20 @@ with t6:
             vals = ddf[["Condition", "Replicate", "Relative Quantity"]].copy()
             usable = vals.dropna(subset=["Relative Quantity"])
 
-            # データがあれば Replicate 平均 → Condition の Mean/SEM
             if not usable.empty:
+                # Condition x Replicate 毎の平均とSEMを使用
                 rep_means = (
                     usable.groupby(["Condition", "Replicate"], observed=False)["Relative Quantity"]
                           .mean()
                           .reset_index(name="Rep_Mean")
                 )
+                # 各 Condition で Bio Rep の平均と SEM（= sd/sqrt(n)）
                 _cs = (
                     rep_means.groupby("Condition", observed=False)["Rep_Mean"]
                              .agg(Mean="mean", SEM=lambda s: s.std(ddof=1) / np.sqrt(s.count()))
                              .reset_index()
                 )
+
                 if not _cs.empty:
                     merged = cond_stats.merge(_cs, on="Condition", how="left", suffixes=("_base", ""))
                     mean_new = merged["Mean"].where(merged["Mean"].notna(), merged["Mean_base"])
@@ -600,13 +580,26 @@ with t6:
                 spine.set_linewidth(0.4)
             return True
 
-        # ---- layout (2in x 2in tiles) ----
-        NCOLS, NROWS = 4, 3               # 12 panels per page
-        PANEL_W, PANEL_H = 2.0, 2.0       # each panel
-        FIG_W, FIG_H = NCOLS * PANEL_W, NROWS * PANEL_H
+               # ---- layout (auto adjust by Condition count) ----
+        condition_list = st.session_state.conditions
+        n_conditions = len(condition_list)
+        n_detectors = len(st.session_state.df_smp_updated["Detector Name"].dropna().unique())
 
-        dets  = st.session_state.df_smp_updated["Detector Name"].dropna().unique().tolist()
-        conds = st.session_state.conditions  # keep the user-defined order
+        # Conditionの数に応じて、1行に表示するグラフの数を自動で変更するように変更
+        if n_conditions <= 4:
+            max_cols = 4
+        elif n_conditions <= 6:
+            max_cols = 3
+        else:
+            max_cols = 2
+
+        # 検出器数に応じて行数を算出
+        n_cols = min(max_cols, n_detectors)
+        n_rows = math.ceil(n_detectors / n_cols)
+
+        # 各パネルサイズ（固定）
+        PANEL_W, PANEL_H = 2.0, 2.0
+        FIG_W, FIG_H = n_cols * PANEL_W, n_rows * PANEL_H
 
         # A) Relative-quantity grid PDF + UI previews (PNG)
         relq_pdf_buf   = io.BytesIO()
