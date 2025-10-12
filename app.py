@@ -513,7 +513,7 @@ with t6:
         today = pd.Timestamp.now().strftime("%Y-%m-%d")
         base_name = f"{today}qPCR_Results"
 
-      # ---- helper: draw panels (ALWAYS show all conditions; 0 if missing) ----
+        # ---- helper: draw panels (ALWAYS show all conditions; 0 if missing) ----
         def draw_relq_panel(ax, ddf, conds):
             """
             Bar = Mean of 'Relative Quantity' per Condition,
@@ -521,20 +521,20 @@ with t6:
             Even when a condition has no data, draw a bar at 0 (so it never disappears).
             Replicate dots are plotted only for conditions that have data.
             """
-            # すべての条件を 0 初期化（データが無くても棒を描く）
+            # 全条件を 0 初期化（データ無しでも棒を描く）
             cond_stats = pd.DataFrame({"Condition": conds, "Mean": 0.0, "SEM": 0.0})
 
             vals = ddf[["Condition", "Replicate", "Relative Quantity"]].copy()
             usable = vals.dropna(subset=["Relative Quantity"])
 
             if not usable.empty:
-                # Condition x Replicate 毎の平均とSEMを使用
+                # 棒グラフ (平均値 ± SEM) を Condition ごとにまとめる）
                 rep_means = (
                     usable.groupby(["Condition", "Replicate"], observed=False)["Relative Quantity"]
                           .mean()
                           .reset_index(name="Rep_Mean")
                 )
-                # 各 Condition で Bio Rep の平均と SEM（= sd/sqrt(n)）
+                # Conditionごとの Mean と SEM（= sd/sqrt(n)）
                 _cs = (
                     rep_means.groupby("Condition", observed=False)["Rep_Mean"]
                              .agg(Mean="mean", SEM=lambda s: s.std(ddof=1) / np.sqrt(s.count()))
@@ -581,12 +581,13 @@ with t6:
                 spine.set_linewidth(0.4)
             return True
 
-               # ---- layout (auto adjust by Condition count) ----
+        # ---- layout (auto adjust by Condition count) ----
         condition_list = st.session_state.conditions
+        dets = st.session_state.df_smp_updated["Detector Name"].dropna().unique().tolist()
+        n_detectors = len(dets)
         n_conditions = len(condition_list)
-        n_detectors = len(st.session_state.df_smp_updated["Detector Name"].dropna().unique())
 
-        # Conditionの数に応じて、1行に表示するグラフの数を自動で変更するように変更
+        # 1ページあたり最大の横列数を条件数に応じて可変化
         if n_conditions <= 4:
             max_cols = 4
         elif n_conditions <= 6:
@@ -594,9 +595,10 @@ with t6:
         else:
             max_cols = 2
 
-        # 検出器数に応じて行数を算出
-        n_cols = min(max_cols, n_detectors)
-        n_rows = math.ceil(n_detectors / n_cols)
+        # 列数・行数を決定
+        n_cols = min(max_cols, n_detectors) if n_detectors > 0 else 1
+        n_rows = math.ceil(n_detectors / n_cols) if n_cols > 0 else 1
+        PAGE_CAP = n_cols * n_rows  # 1ページのパネル数
 
         # 各パネルサイズ（固定）
         PANEL_W, PANEL_H = 2.0, 2.0
@@ -610,30 +612,31 @@ with t6:
             fig = None; axs = None
 
             for det in dets:
-                if panel_i % (NCOLS * NROWS) == 0:
-                    # flush previous page
+                if panel_i % PAGE_CAP == 0:
+                    # 直前ページを保存
                     if fig is not None:
                         fig.tight_layout(pad=0.8); pdf.savefig(fig)
                         buf_png = io.BytesIO()
                         fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
                         relq_page_pngs.append(buf_png.getvalue())
                         plt.close(fig)
-                    fig, ax_grid = plt.subplots(NROWS, NCOLS, figsize=(FIG_W, FIG_H))
-                    axs = ax_grid.flatten()
+                    # 新規ページ
+                    fig, ax_grid = plt.subplots(n_rows, n_cols, figsize=(FIG_W, FIG_H))
+                    axs = ax_grid.flatten() if hasattr(ax_grid, "flatten") else [ax_grid]
 
-                ax  = axs[panel_i % (NCOLS * NROWS)]
+                ax  = axs[panel_i % PAGE_CAP]
                 ddf = st.session_state.df_smp_updated[
                     st.session_state.df_smp_updated["Detector Name"] == det
                 ].copy()
 
-                draw_relq_panel(ax, ddf, conds)
+                draw_relq_panel(ax, ddf, condition_list)
                 ax.set_title(det, fontsize=9)
                 panel_i += 1
 
             if fig is not None:
-                used = panel_i % (NCOLS * NROWS) or (NCOLS * NROWS)
-                if used < (NCOLS * NROWS):
-                    for k in range(used, NCOLS * NROWS):
+                used = panel_i % PAGE_CAP or PAGE_CAP
+                if used < PAGE_CAP:
+                    for k in range(used, PAGE_CAP):
                         axs[k].axis("off")
                 fig.tight_layout(pad=0.8); pdf.savefig(fig)
                 buf_png = io.BytesIO()
@@ -641,7 +644,7 @@ with t6:
                 relq_page_pngs.append(buf_png.getvalue())
                 plt.close(fig)
 
-        # B) Standard-curve PDF + previews (unchanged)
+        # B) Standard-curve PDF + previews
         std_pdf_buf   = io.BytesIO()
         std_page_pngs = []
         with PdfPages(std_pdf_buf) as pdf:
@@ -663,17 +666,17 @@ with t6:
                     slope = float(model.coef_[0]); intercept = float(model.intercept_)
                     r2    = r2_score(y, model.predict(X))
 
-                    if panel_i % (NCOLS * NROWS) == 0:
+                    if panel_i % PAGE_CAP == 0:
                         if fig is not None:
                             fig.tight_layout(pad=0.8); pdf.savefig(fig)
                             buf_png = io.BytesIO()
                             fig.savefig(buf_png, format="png", dpi=200, bbox_inches="tight")
                             std_page_pngs.append(buf_png.getvalue())
                             plt.close(fig)
-                        fig, ax_grid = plt.subplots(NROWS, NCOLS, figsize=(FIG_W, FIG_H))
-                        axs = ax_grid.flatten()
+                        fig, ax_grid = plt.subplots(n_rows, n_cols, figsize=(FIG_W, FIG_H))
+                        axs = ax_grid.flatten() if hasattr(ax_grid, "flatten") else [ax_grid]
 
-                    ax = axs[panel_i % (NCOLS * NROWS)]
+                    ax = axs[panel_i % PAGE_CAP]
                     x  = np.log10(dwork["Quantity"]); yv = dwork["Ct"]
                     ax.scatter(x, yv, s=10, color="black")
                     xx = np.linspace(x.min(), x.max(), 100).reshape(-1, 1)
@@ -687,9 +690,9 @@ with t6:
                     panel_i += 1
 
                 if fig is not None:
-                    used = panel_i % (NCOLS * NROWS) or (NCOLS * NROWS)
-                    if used < (NCOLS * NROWS):
-                        for k in range(used, NCOLS * NROWS):
+                    used = panel_i % PAGE_CAP or PAGE_CAP
+                    if used < PAGE_CAP:
+                        for k in range(used, PAGE_CAP):
                             axs[k].axis("off")
                     fig.tight_layout(pad=0.8); pdf.savefig(fig)
                     buf_png = io.BytesIO()
