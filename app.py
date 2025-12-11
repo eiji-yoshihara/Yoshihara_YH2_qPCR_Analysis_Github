@@ -8,7 +8,7 @@ from matplotlib.backends.backend_pdf import PdfPages
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import r2_score
 
-st.set_page_config(page_title="Yoshihara Lab SOP Software YH#2 qPCR_Analysis_v0.2.1", layout="wide")
+st.set_page_config(page_title="Yoshihara Lab SOP Software YH#2 qPCR_Analysis_v0.2.3_QuantStudio6", layout="wide")
 st.title("🧬 Yoshihara Lab SOP Software YH#2 qPCR_Analysis_v0.2.1")
 
 # ---------- Core helpers ----------
