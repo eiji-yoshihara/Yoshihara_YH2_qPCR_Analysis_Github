@@ -13,7 +13,7 @@ st.title("🧬 Yoshihara Lab SOP Software YH#2 qPCR_Analysis_v0.2.1")
 
 # ---------- Core helpers ----------
 def read_qpcr_textfile(content_bytes: bytes) -> pd.DataFrame:
-    # 文字コード: utf-8 → cp932 の順で試す
+    # --- Try UTF-8 or CP932 ---
     text = None
     for enc in ("utf-8", "cp932"):
         try:
@@ -25,29 +25,48 @@ def read_qpcr_textfile(content_bytes: bytes) -> pd.DataFrame:
         raise ValueError("Encoding error (utf-8/cp932 Failed)")
 
     lines = text.splitlines()
-    header_idx = next((i for i,l in enumerate(lines) if l.strip().startswith("Well")), None)
+
+    # --- Find header line (行のどこかに Well が含まれていればOK) ---
+    header_idx = None
+    for i, l in enumerate(lines):
+        if "Well" in l.split():
+            header_idx = i
+            break
     if header_idx is None:
-        raise ValueError("Header line 'Well ...' Not Found")
-    data_str = "\n".join(lines[header_idx:])
+        raise ValueError("Header line containing 'Well' not found")
 
-    # 区切り推定
-    try:
-        df = pd.read_csv(io.StringIO(data_str), sep=",", engine="python")
-        if df.shape[1] <= 1:
-            raise ValueError
-    except Exception:
-        try:
-            sniff = csv.Sniffer().sniff(data_str.split("\n",1)[0])
-            sep = sniff.delimiter
-        except Exception:
-            sep = r"\s+"
-        df = pd.read_csv(io.StringIO(data_str), sep=sep, engine="python")
+    header_line = lines[header_idx]
 
-    if "Reporter" in df.columns:
-        df = df[df["Reporter"].astype(str)=="SYBR"]
+    # --- 区切り文字を推定 ---
+    if "," in header_line:
+        sep = ","
+    elif "\t" in header_line:
+        sep = "\t"
+    else:
+        sep = r"\s+"
 
-    keep = ["Well","Sample","Target","Reporter","Task","Cq","Quantity"]
-    df = df.loc[:, [c for c in keep if c in df.columns]]
+    df = pd.read_csv(io.StringIO("\n".join(lines[header_idx:])), sep=sep, engine="python")
+    df.columns = [c.strip() for c in df.columns]
+
+    # Cq 列名のゆらぎに対応
+    if "Cq" not in df.columns:
+        cq_col = next((c for c in df.columns if c.lower() in ("cq", "ct", "cq mean")), None)
+        if cq_col:
+            df.rename(columns={cq_col: "Cq"}, inplace=True)
+        else:
+            raise ValueError("Cq column not found")
+
+    # Target, Task も念のためそろえておく
+    if "Target" not in df.columns:
+        tgt = next((c for c in df.columns if "target" in c.lower() or "detector" in c.lower()), None)
+        if tgt:
+            df.rename(columns={tgt: "Target"}, inplace=True)
+
+    if "Task" not in df.columns:
+        task = next((c for c in df.columns if c.lower() == "task"), None)
+        if task:
+            df.rename(columns={task: "Task"}, inplace=True)
+
     return df
 
 def clean_dataframe_for_analysis(df: pd.DataFrame) -> pd.DataFrame:
@@ -172,12 +191,12 @@ with t2:
         st.info("Please Complete Upload")
     else:
         df_std = st.session_state.df_raw.copy()
-        df_std = df_std[df_std["Task"].astype(str).str.lower()=="STANDARD"].dropna(subset=["Cq"]).copy()
+        df_std = df_std[df_std["Task"].astype(str).str.lower()=="standard"].dropna(subset=["Cq"]).copy()
         if "Well" in df_std.columns: df_std["Well"] = pd.to_numeric(df_std["Well"], errors="coerce")
         df_std = df_std.sort_values(["Target","Quantity","Well"], na_position="last")
         drops = []
         for (det, qty), sub in df_std.groupby(["Target","Quantity"], dropna=False):
-            st.markdown(f"**{det} — Qty {qty}**  (ΔCq={sub['Cq'].max()-sub['Ct'].min():.2f})")
+            st.markdown(f"**{det} — Qty {qty}**  (ΔCq={sub['Cq'].max()-sub['Cq'].min():.2f})")
             show = sub[["Well","Sample","Cq"]].reset_index()
             idxs = st.multiselect("Drop rows", options=show["index"].tolist(),
                                   format_func=lambda i: f"Well {int(df_std.loc[i,'Well']) if pd.notna(df_std.loc[i,'Well']) else '?'} / {df_std.loc[i,'Sample']} (Ct={df_std.loc[i,'Ct']})",
