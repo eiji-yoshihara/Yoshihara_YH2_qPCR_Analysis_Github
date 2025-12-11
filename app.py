@@ -1,5 +1,5 @@
 import io, os, zipfile, warnings, csv
-import math 
+import math
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -32,7 +32,7 @@ def read_qpcr_textfile(content_bytes: bytes) -> pd.DataFrame:
 
     # 区切り推定
     try:
-        df = pd.read_csv(io.StringIO(data_str), sep="\t", engine="python")
+        df = pd.read_csv(io.StringIO(data_str), sep=",", engine="python")
         if df.shape[1] <= 1:
             raise ValueError
     except Exception:
@@ -46,7 +46,7 @@ def read_qpcr_textfile(content_bytes: bytes) -> pd.DataFrame:
     if "Reporter" in df.columns:
         df = df[df["Reporter"].astype(str)=="SYBR"]
 
-    keep = ["Well","Sample Name","Detector Name","Reporter","Task","Ct","Quantity"]
+    keep = ["Well","Sample","Target","Reporter","Task","Cq","Quantity"]
     df = df.loc[:, [c for c in keep if c in df.columns]]
     return df
 
@@ -57,14 +57,14 @@ def clean_dataframe_for_analysis(df: pd.DataFrame) -> pd.DataFrame:
         cands = [c for c in df.columns if cond(c)]
         if cands: df.rename(columns={cands[0]:target}, inplace=True)
     _rn("Reporter", lambda c:c.lower()=="reporter")
-    _rn("Ct", lambda c:c.lower()=="ct")
-    _rn("Sample Name", lambda c:c.lower() in ("sample","sample_name","samplename"))
-    _rn("Detector Name", lambda c:"detector" in c.lower())
+    _rn("Cq", lambda c:c.lower() in ("ct", "cq"))
+    _rn("Sample", lambda c:c.lower() in ("sample","sample_name","samplename"))
+    _rn("Target", lambda c:"detector" in c.lower() or c.lower()=="target")
     _rn("Task", lambda c:c.lower()=="task")
     _rn("Quantity", lambda c:"quantity" in c.lower())
 
     # Undetermined → NaN
-    df["Ct"] = pd.to_numeric(df["Ct"].replace({"Undetermined":np.nan,"undetermined":np.nan}), errors="coerce")
+    df["Cq"] = pd.to_numeric(df["Cq"].replace({"Undetermined":np.nan,"undetermined":np.nan}), errors="coerce")
     df["Quantity"] = pd.to_numeric(df.get("Quantity", np.nan), errors="coerce")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -73,20 +73,20 @@ def clean_dataframe_for_analysis(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def compute_standard_curve(df_std: pd.DataFrame):
-    d = df_std.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct","Quantity"]).copy()
+    d = df_std.replace([np.inf, -np.inf], np.nan).dropna(subset=["Cq","Quantity"]).copy()
     d = d[d["Quantity"] > 0]
     if len(d) < 2:
         return None
     X = np.log10(d["Quantity"].values).reshape(-1,1)
-    y = d["Ct"].values
+    y = d["Cq"].values
     model = LinearRegression().fit(X,y)
     r2 = r2_score(y, model.predict(X))
     return {"slope": float(model.coef_[0]), "intercept": float(model.intercept_), "r2": float(r2), "model": model}
 
-def ct_to_quantity(ct, slope, intercept):
-    if pd.isna(ct) or slope == 0 or np.isnan(slope):
+def cq_to_quantity(cq, slope, intercept):
+    if pd.isna(cq) or slope == 0 or np.isnan(slope):
         return np.nan
-    return float(10 ** ((ct - intercept) / slope))
+    return float(10 ** ((cq - intercept) / slope))
 
 # ---------- State ----------
 if "df_raw" not in st.session_state:
@@ -152,12 +152,12 @@ with t1:
         st.caption("Preview of the first rows (max 30)")
         st.dataframe(st.session_state.df_raw.head(30), use_container_width=True)
 
-        need = {"Task", "Ct", "Detector Name"}
+        need = {"Task", "Cq", "Target"}
         miss = [c for c in need if c not in st.session_state.df_raw.columns]
         if miss:
             st.error(f"Missing required columns: {miss}")
         else:
-            cols = [c for c in ["Detector Name", "Task", "SourceFile"] if c in st.session_state.df_raw.columns]
+            cols = [c for c in ["Target", "Task", "SourceFile"] if c in st.session_state.df_raw.columns]
             if cols:
                 with st.expander("Summary（Detector/Task/SourceFile）", expanded=False):
                     st.write(
@@ -172,15 +172,15 @@ with t2:
         st.info("Please Complete Upload")
     else:
         df_std = st.session_state.df_raw.copy()
-        df_std = df_std[df_std["Task"].astype(str).str.lower()=="standard"].dropna(subset=["Ct"]).copy()
+        df_std = df_std[df_std["Task"].astype(str).str.lower()=="STANDARD"].dropna(subset=["Cq"]).copy()
         if "Well" in df_std.columns: df_std["Well"] = pd.to_numeric(df_std["Well"], errors="coerce")
-        df_std = df_std.sort_values(["Detector Name","Quantity","Well"], na_position="last")
+        df_std = df_std.sort_values(["Target","Quantity","Well"], na_position="last")
         drops = []
-        for (det, qty), sub in df_std.groupby(["Detector Name","Quantity"], dropna=False):
-            st.markdown(f"**{det} — Qty {qty}**  (ΔCt={sub['Ct'].max()-sub['Ct'].min():.2f})")
-            show = sub[["Well","Sample Name","Ct"]].reset_index()
+        for (det, qty), sub in df_std.groupby(["Target","Quantity"], dropna=False):
+            st.markdown(f"**{det} — Qty {qty}**  (ΔCq={sub['Cq'].max()-sub['Ct'].min():.2f})")
+            show = sub[["Well","Sample","Cq"]].reset_index()
             idxs = st.multiselect("Drop rows", options=show["index"].tolist(),
-                                  format_func=lambda i: f"Well {int(df_std.loc[i,'Well']) if pd.notna(df_std.loc[i,'Well']) else '?'} / {df_std.loc[i,'Sample Name']} (Ct={df_std.loc[i,'Ct']})",
+                                  format_func=lambda i: f"Well {int(df_std.loc[i,'Well']) if pd.notna(df_std.loc[i,'Well']) else '?'} / {df_std.loc[i,'Sample']} (Ct={df_std.loc[i,'Ct']})",
                                   key=f"drop_{det}_{qty}")
             drops += idxs
             st.dataframe(show.drop(columns=["index"]), use_container_width=True)
@@ -198,14 +198,14 @@ with t3:
     else:
         buf_pdf = io.BytesIO()
         with PdfPages(buf_pdf) as pdf:
-            for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
-                ddf = st.session_state.df_std_clean[st.session_state.df_std_clean["Detector Name"]==det]
+            for det in st.session_state.df_std_clean["Target"].dropna().unique():
+                ddf = st.session_state.df_std_clean[st.session_state.df_std_clean["Target"]==det]
                 sc = compute_standard_curve(ddf)
                 fig, ax = plt.subplots(figsize=(5,3.2))
-                ax.set_title(f"Standard curve: {det}")
-                ax.set_xlabel("log10(Quantity)"); ax.set_ylabel("Ct")
+                ax.set_title(f"STANDARD curve: {det}")
+                ax.set_xlabel("log10(Quantity)"); ax.set_ylabel("Cq")
                 if sc:
-                    x = np.log10(ddf["Quantity"]); y = ddf["Ct"]
+                    x = np.log10(ddf["Quantity"]); y = ddf["Cq"]
                     ax.scatter(x,y, color="black", s=12)
                     xx = np.linspace(x.min(), x.max(), 100).reshape(-1,1)
                     ax.plot(xx, sc["model"].predict(xx), "--", linewidth=0.8, color="black")
@@ -224,15 +224,15 @@ with t4:
     else:
         # ---- Build working table: Unknown only ----
         work = st.session_state.df_raw.copy()
-        work = work[work["Task"].astype(str).str.lower() == "unknown"].copy()
+        work = work[work["Task"].astype(str).str.lower() == "UNKNOWN"].copy()
 
         # Sort: Detector -> Well (numeric if possible)
         if "Well" in work.columns:
             work["Well"] = pd.to_numeric(work["Well"], errors="coerce")
-            work = work.sort_values(["Detector Name", "Well"], na_position="last").reset_index(drop=False)
+            work = work.sort_values(["Target", "Well"], na_position="last").reset_index(drop=False)
             base_index = work["index"].to_list()  # original df_raw indices
         else:
-            work = work.sort_values(["Detector Name"]).reset_index(drop=False)
+            work = work.sort_values(["Target"]).reset_index(drop=False)
             base_index = work["index"].to_list()
 
         # ---- Session assignment table (Condition/Replicate) ----
@@ -258,11 +258,11 @@ with t4:
         st.markdown("---")
 
         # ---- Per-detector assignment UI ----
-        for det in sorted(work["Detector Name"].dropna().unique().tolist()):
+        for det in sorted(work["Target"].dropna().unique().tolist()):
             with st.expander(f"Detector: {det}", expanded=False):
-                sub = work[work["Detector Name"] == det].copy().reset_index(drop=True)  # has 'index' (df_raw row id)
+                sub = work[work["Target"] == det].copy().reset_index(drop=True)  # has 'index' (df_raw row id)
 
-                # ====== Filter (Sample/Well/Ct) ======
+                # ====== Filter (Sample/Well/Cq) ======
                 view = sub.copy()
 
                 # ====== Multi-select target rows ======
@@ -279,7 +279,7 @@ with t4:
                             well_str = str(int(w)) if w.is_integer() else str(well_val)
                         except Exception:
                             well_str = str(well_val)
-                    label = f"{r['Sample Name']} (Well={well_str}, Ct={r.get('Ct')})"
+                    label = f"{r['Sample']} (Well={well_str}, Cq={r.get('Cq')})"
                     options.append((label, int(r["index"])))
 
                 sel_key = f"ms_{det}"
@@ -354,7 +354,7 @@ with t4:
 
                 # ====== Preview (with current assignments) ======
                 st.caption("Updated table (after operations)")
-                sub_preview = work[work["Detector Name"] == det][["index", "Sample Name", "Ct"]].copy()
+                sub_preview = work[work["Target"] == det][["index", "Sample", "Cq"]].copy()
                 sub_preview["Condition"] = st.session_state.assign_df.loc[sub_preview["index"], "Condition"].values
                 sub_preview["Replicate"] = st.session_state.assign_df.loc[sub_preview["index"], "Replicate"].values
                 sub_preview = sub_preview.drop(columns=["index"])
@@ -366,7 +366,7 @@ with t4:
         if st.button("Save assignment", type="primary", key="save_assign"):
             assigned = st.session_state.assign_df.copy()
             target_idx = st.session_state.df_raw.index[
-                st.session_state.df_raw["Task"].astype(str).str.lower() == "unknown"
+                st.session_state.df_raw["Task"].astype(str).str.lower() == "UNKNOWN"
             ]
             missing_mask = (assigned.loc[target_idx, "Condition"] == "") | (assigned.loc[target_idx, "Replicate"] == "")
             if missing_mask.any():
@@ -382,7 +382,7 @@ with t4:
                 st.session_state.df_raw.loc[:, "Replicate"] = assigned["Replicate"].fillna(st.session_state.df_raw["Replicate"])
 
                 st.session_state.df_smp = st.session_state.df_raw[
-                    st.session_state.df_raw["Task"].astype(str).str.lower() == "unknown"
+                    st.session_state.df_raw["Task"].astype(str).str.lower() == "UNKNOWN"
                 ].copy()
 
                 st.success("Assignments saved.")
@@ -395,10 +395,10 @@ with t5:
         df_smp = st.session_state.df_smp.copy()
         df_smp["Quantity"] = np.nan
 
-        # --- 1) Ct -> Quantity for each detector via standard curve ---
-        for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
+        # --- 1) Cq -> Quantity for each detector via standard curve ---
+        for det in st.session_state.df_std_clean["Target"].dropna().unique():
             dstd = st.session_state.df_std_clean[
-                (st.session_state.df_std_clean["Detector Name"] == det) &
+                (st.session_state.df_std_clean["Target"] == det) &
                 (st.session_state.df_std_clean["Task"].astype(str).str.lower() == "standard")
             ].copy()
 
@@ -408,23 +408,23 @@ with t5:
                 continue
 
             slope, intercept = sc["slope"], sc["intercept"]
-            mask = (df_smp["Detector Name"] == det)
-            df_smp.loc[mask, "Quantity"] = df_smp.loc[mask, "Ct"].apply(
-                lambda c: ct_to_quantity(c, slope, intercept)
+            mask = (df_smp["Target"] == det)
+            df_smp.loc[mask, "Quantity"] = df_smp.loc[mask, "Cq"].apply(
+                lambda c: cq_to_quantity(c, slope, intercept)
             )
             # guard against negative due to numeric glitches
             df_smp.loc[mask & (df_smp["Quantity"] < 0), "Quantity"] = np.nan
 
-        detectors_for_ctrl = sorted(df_smp["Detector Name"].dropna().unique().tolist())
+        detectors_for_ctrl = sorted(df_smp["Target"].dropna().unique().tolist())
         if not detectors_for_ctrl:
-            st.error("Detector Name was not found. Please check Upload/Assign")
+            st.error("Target was not found. Please check Upload/Assign")
         else:
             ctrl_det = st.selectbox("Control detector", detectors_for_ctrl, key="ctrl_det_select")
 
             if st.button("Run Relative Quantification"):
                 # --- 2) Build control table (attach orig_index for order alignment) ---
                 ctrl_df = (
-                    df_smp[df_smp["Detector Name"] == ctrl_det][["Condition", "Replicate", "Quantity"]]
+                    df_smp[df_smp["Target"] == ctrl_det][["Condition", "Replicate", "Quantity"]]
                     .rename(columns={"Quantity": "Ctrl_Quantity"})
                     .copy()
                 )
@@ -444,8 +444,8 @@ with t5:
                     df_temp["Relative Quantity"] = np.nan
 
                 # --- 3) Per-detector relative quantification ---
-                for det in df_temp["Detector Name"].dropna().unique():
-                    m = (df_temp["Detector Name"] == det)
+                for det in df_temp["Target"].dropna().unique():
+                    m = (df_temp["Target"] == det)
                     ddet = (
                         df_temp.loc[m, ["Condition", "Replicate", "Quantity"]]
                         .reset_index()
@@ -488,13 +488,13 @@ with t5:
 
                 # --- 4) Mean/SEM per (Detector, Condition, Replicate) ---
                 stats = (
-                    df_temp.groupby(["Detector Name", "Condition", "Replicate"], observed=False)["Relative Quantity"]
+                    df_temp.groupby(["Target", "Condition", "Replicate"], observed=False)["Relative Quantity"]
                     .agg(["mean", "sem"]).reset_index()
                     .rename(columns={"mean": "RelQ_Mean", "sem": "RelQ_SEM"})
                 )
 
                 st.session_state.df_smp_updated = df_temp.merge(
-                    stats, on=["Detector Name", "Condition", "Replicate"], how="left"
+                    stats, on=["Target", "Condition", "Replicate"], how="left"
                 )
                 st.success("Relative quantification done.")
 
@@ -583,7 +583,7 @@ with t6:
 
         # ---- layout (auto adjust by Condition count) ----
         condition_list = st.session_state.conditions
-        dets = st.session_state.df_smp_updated["Detector Name"].dropna().unique().tolist()
+        dets = st.session_state.df_smp_updated["Target"].dropna().unique().tolist()
         n_detectors = len(dets)
         n_conditions = len(condition_list)
 
@@ -626,7 +626,7 @@ with t6:
 
                 ax  = axs[panel_i % PAGE_CAP]
                 ddf = st.session_state.df_smp_updated[
-                    st.session_state.df_smp_updated["Detector Name"] == det
+                    st.session_state.df_smp_updated["Target"] == det
                 ].copy()
 
                 draw_relq_panel(ax, ddf, condition_list)
@@ -651,17 +651,17 @@ with t6:
             if st.session_state.df_std_clean is not None and not st.session_state.df_std_clean.empty:
                 panel_i = 0
                 fig = None; axs = None
-                for det in st.session_state.df_std_clean["Detector Name"].dropna().unique():
+                for det in st.session_state.df_std_clean["Target"].dropna().unique():
                     ddf   = st.session_state.df_std_clean[
-                        st.session_state.df_std_clean["Detector Name"] == det
+                        st.session_state.df_std_clean["Target"] == det
                     ].copy()
-                    dwork = ddf.replace([np.inf, -np.inf], np.nan).dropna(subset=["Ct", "Quantity"])
+                    dwork = ddf.replace([np.inf, -np.inf], np.nan).dropna(subset=["Cq", "Quantity"])
                     dwork = dwork[dwork["Quantity"] > 0]
                     if len(dwork) < 2:
                         continue
 
                     X = np.log10(dwork["Quantity"].to_numpy()).reshape(-1, 1)
-                    y = dwork["Ct"].to_numpy()
+                    y = dwork["Cq"].to_numpy()
                     model = LinearRegression().fit(X, y)
                     slope = float(model.coef_[0]); intercept = float(model.intercept_)
                     r2    = r2_score(y, model.predict(X))
@@ -677,13 +677,13 @@ with t6:
                         axs = ax_grid.flatten() if hasattr(ax_grid, "flatten") else [ax_grid]
 
                     ax = axs[panel_i % PAGE_CAP]
-                    x  = np.log10(dwork["Quantity"]); yv = dwork["Ct"]
+                    x  = np.log10(dwork["Quantity"]); yv = dwork["Cq"]
                     ax.scatter(x, yv, s=10, color="black")
                     xx = np.linspace(x.min(), x.max(), 100).reshape(-1, 1)
                     ax.plot(xx, model.predict(xx), "--", linewidth=0.8, color="black")
                     ax.set_title(f"{det}\nslope={slope:.3f}, R²={r2:.3f}", fontsize=8)
                     ax.set_xlabel("log10(Quantity)", fontsize=7)
-                    ax.set_ylabel("Ct", fontsize=7)
+                    ax.set_ylabel("Cq", fontsize=7)
                     ax.tick_params(labelsize=7)
                     for spine in ax.spines.values():
                         spine.set_linewidth(0.4)
@@ -726,9 +726,9 @@ with t6:
         else:
             st.info("There are no pages available for display in the RelQ grid.")
 
-        st.subheader("📄 Standard curves preview")
+        st.subheader("📄 STANDARD curves preview")
         if std_page_pngs:
             for i, png in enumerate(std_page_pngs, start=1):
-                st.image(png, caption=f"Standard curves page {i}", use_column_width=True)
+                st.image(png, caption=f"STANDARD curves page {i}", use_column_width=True)
         else:
-            st.info("There are no pages available for display in the Standard Curves section.")
+            st.info("There are no pages available for display in the STANDARD Curves section.")
