@@ -26,10 +26,11 @@ def read_qpcr_textfile(content_bytes: bytes) -> pd.DataFrame:
 
     lines = text.splitlines()
 
-    # --- Find header line (行のどこかに Well が含まれていればOK) ---
+    # --- Find header line (先頭が Well ならOK; BOM や空白も無視) ---
     header_idx = None
     for i, l in enumerate(lines):
-        if "Well" in l.split():
+        first = l.lstrip("\ufeff").lstrip()  # BOM + 先頭スペース除去
+        if first.startswith("Well"):
             header_idx = i
             break
     if header_idx is None:
