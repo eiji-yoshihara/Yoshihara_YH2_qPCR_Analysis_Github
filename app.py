@@ -24,17 +24,42 @@ def read_qpcr_textfile(content_bytes: bytes) -> pd.DataFrame:
     if text is None:
         raise ValueError("Encoding error (utf-8/cp932 Failed)")
 
+        import re
+
     lines = text.splitlines()
 
-    # --- Find header line (先頭が Well ならOK; BOM や空白も無視) ---
+    # --- 1st: 普通に "Well" を含む行を探す ---
     header_idx = None
     for i, l in enumerate(lines):
-        first = l.lstrip("\ufeff").lstrip()  # BOM + 先頭スペース除去
-        if first.startswith("Well"):
+        if ("Well" in l) and ("Sample" in l):
             header_idx = i
             break
+
+    # --- 2nd: それでも見つからないときのフォールバック ---
+    # 「1, A1, S5, ...」のような “ウェルのデータ行” を探して、
+    # その 1 行前をヘッダー行とみなす
     if header_idx is None:
-        raise ValueError("Header line containing 'Well' not found")
+        well_data_idx = None
+        for i, l in enumerate(lines):
+            for sep_candidate in ("\t", ",", ";"):
+                parts = l.split(sep_candidate)
+                if len(parts) < 3:
+                    continue
+                first = parts[0].strip()
+                second = parts[1].strip()
+                # 1列目が数字、2列目が A1〜H24 みたいな形なら「ウェルの行」
+                if first.isdigit() and re.match(r"^[A-Ha-h]\d{1,2}$", second):
+                    well_data_idx = i
+                    break
+            if well_data_idx is not None:
+                break
+
+        if well_data_idx is not None and well_data_idx > 0:
+            header_idx = well_data_idx - 1
+
+    # それでも無理ならエラー
+    if header_idx is None:
+        raise ValueError("Header line containing 'Well' (or well data rows) not found")
 
     header_line = lines[header_idx]
 
@@ -200,7 +225,7 @@ with t2:
             st.markdown(f"**{det} — Qty {qty}**  (ΔCq={sub['Cq'].max()-sub['Cq'].min():.2f})")
             show = sub[["Well","Sample","Cq"]].reset_index()
             idxs = st.multiselect("Drop rows", options=show["index"].tolist(),
-                                  format_func=lambda i: f"Well {int(df_std.loc[i,'Well']) if pd.notna(df_std.loc[i,'Well']) else '?'} / {df_std.loc[i,'Sample']} (Cq={df_std.loc[i,'Ct']})",
+                                  format_func=lambda i: f"Well {int(df_std.loc[i,'Well']) if pd.notna(df_std.loc[i,'Well']) else '?'} / {df_std.loc[i,'Sample']} (Cq={df_std.loc[i,'Cq']})",
                                   key=f"drop_{det}_{qty}")
             drops += idxs
             st.dataframe(show.drop(columns=["index"]), use_container_width=True)
