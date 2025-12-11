@@ -199,7 +199,7 @@ with t2:
             st.markdown(f"**{det} — Qty {qty}**  (ΔCq={sub['Cq'].max()-sub['Cq'].min():.2f})")
             show = sub[["Well","Sample","Cq"]].reset_index()
             idxs = st.multiselect("Drop rows", options=show["index"].tolist(),
-                                  format_func=lambda i: f"Well {int(df_std.loc[i,'Well']) if pd.notna(df_std.loc[i,'Well']) else '?'} / {df_std.loc[i,'Sample']} (Ct={df_std.loc[i,'Ct']})",
+                                  format_func=lambda i: f"Well {int(df_std.loc[i,'Well']) if pd.notna(df_std.loc[i,'Well']) else '?'} / {df_std.loc[i,'Sample']} (Cq={df_std.loc[i,'Ct']})",
                                   key=f"drop_{det}_{qty}")
             drops += idxs
             st.dataframe(show.drop(columns=["index"]), use_container_width=True)
@@ -243,7 +243,7 @@ with t4:
     else:
         # ---- Build working table: Unknown only ----
         work = st.session_state.df_raw.copy()
-        work = work[work["Task"].astype(str).str.lower() == "UNKNOWN"].copy()
+        work = work[work["Task"].astype(str).str.lower() == "unknown"].copy()
 
         # Sort: Detector -> Well (numeric if possible)
         if "Well" in work.columns:
@@ -385,7 +385,7 @@ with t4:
         if st.button("Save assignment", type="primary", key="save_assign"):
             assigned = st.session_state.assign_df.copy()
             target_idx = st.session_state.df_raw.index[
-                st.session_state.df_raw["Task"].astype(str).str.lower() == "UNKNOWN"
+                st.session_state.df_raw["Task"].astype(str).str.lower() == "unknown"
             ]
             missing_mask = (assigned.loc[target_idx, "Condition"] == "") | (assigned.loc[target_idx, "Replicate"] == "")
             if missing_mask.any():
@@ -401,7 +401,7 @@ with t4:
                 st.session_state.df_raw.loc[:, "Replicate"] = assigned["Replicate"].fillna(st.session_state.df_raw["Replicate"])
 
                 st.session_state.df_smp = st.session_state.df_raw[
-                    st.session_state.df_raw["Task"].astype(str).str.lower() == "UNKNOWN"
+                    st.session_state.df_raw["Task"].astype(str).str.lower() == "unknown"
                 ].copy()
 
                 st.success("Assignments saved.")
